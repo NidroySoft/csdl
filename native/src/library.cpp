@@ -5,7 +5,6 @@
 #include <algorithm>
 #include <cstring>
 
-
 // ── Prototipos de funciones implementadas en streaming.cpp ──
 extern "C" {
     const char* start_stream_server_impl(lt::torrent_handle* torrent, int32_t file_index, int32_t port);
@@ -35,10 +34,10 @@ extern "C" {
         session->apply_settings(*settings);
     }
 
-    // ── eventos (delegan en events.cpp) ───────────────────────────────
+    // ── eventos (delegan en events.cpp, ahora por sesión) ─────────────
     void clear_event_callback(lt::session* session) {
         if (!session) return;
-        ::cs_clear_event_callback(session);
+        cs_destroy_event_handler_for_session(session);
     }
 
     void set_event_callback(lt::session* session, cs_alert_callback callback, bool include_unmapped_events) {
@@ -47,8 +46,8 @@ extern "C" {
             clear_event_callback(session);
             return;
         }
-        ::cs_set_event_callback(session, callback, include_unmapped_events);
-    }   
+        cs_create_event_handler(session, callback, include_unmapped_events);
+    }
 
     // ── torrent info ───────────────────────────────────────────────────
     lt::torrent_info* create_torrent_bytes(const char* data, long length) {

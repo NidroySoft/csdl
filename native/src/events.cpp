@@ -1,10 +1,14 @@
-// events.cpp - Corregido: hilo persistente de alertas, sin creación de hilos por alerta
+// events.cpp - Sistema de alertas por sesión, sin variables globales estáticas
 #include "events.h"
 #include <libtorrent/session.hpp>
 #include <libtorrent/alert_types.hpp>
 #include <ctime>
 #include <condition_variable>
 #include <atomic>
+#include <unordered_map>
+#include <memory>
+#include <mutex>
+#include <vector>
 
 // ─── helpers existentes (sin cambios) ─────────────────────────────────────
 void fill_info_hash(const lt::info_hash_t& hashes, char* buffer) {
@@ -34,21 +38,27 @@ void populate_peer_alert(cs_peer_alert* peer_alert, lt::peer_alert* alert, cs_pe
     fill_info_hash(alert->handle.info_hashes(), peer_alert->info_hash);
 }
 
-// ─── nueva infraestructura de alertas ──────────────────────────────────────
-static std::mutex g_alert_mutex;
-static std::condition_variable g_alert_cv;
-static bool g_alert_notify_flag = false;
-static std::thread g_alert_thread;
-static std::atomic<bool> g_alert_running(false);
+// ─── estructura por sesión ──────────────────────────────────────────────
+struct cs_event_handler {
+    lt::session* session = nullptr;
+    cs_alert_callback callback = nullptr;
+    bool include_unmapped = false;
 
-static lt::session* g_session = nullptr;
-static cs_alert_callback g_callback = nullptr;
-static bool g_include_unmapped = false;
+    std::mutex mtx;
+    std::condition_variable cv;
+    bool notify_flag = false;
+    std::thread thread;
+    std::atomic<bool> running{ false };
+};
 
-// función interna que procesa las alertas (SE LLAMA SOLO DESDE EL HILO PERSISTENTE)
-static void process_available_alerts() {
+// Mapa global protegido para almacenar los handlers activos (uno por sesión)
+static std::mutex g_handlers_mutex;
+static std::unordered_map<lt::session*, std::unique_ptr<cs_event_handler>> g_handlers;
+
+// ─── procesamiento de alertas ──────────────────────────────────────────
+static void process_alerts(cs_event_handler* handler) {
     std::vector<lt::alert*> events;
-    g_session->pop_alerts(&events);
+    handler->session->pop_alerts(&events);
 
     for (auto* alert : events) {
         std::string message;
@@ -60,7 +70,7 @@ static void process_available_alerts() {
             status_alert.old_state = state_alert->prev_state;
             fill_info_hash(state_alert->handle.info_hashes(), status_alert.info_hash);
             fill_event_info(&status_alert.alert, alert, cs_alert_type::alert_torrent_status, message);
-            g_callback(&status_alert);
+            handler->callback(&status_alert);
             break;
         }
         case lt::torrent_removed_alert::alert_type: {
@@ -68,7 +78,7 @@ static void process_available_alerts() {
             cs_torrent_remove_alert removed_torrent{};
             fill_info_hash(removed_alert->info_hashes, removed_torrent.info_hash);
             fill_event_info(&removed_torrent.alert, alert, cs_alert_type::alert_torrent_removed, message);
-            g_callback(&removed_torrent);
+            handler->callback(&removed_torrent);
             break;
         }
         case lt::performance_alert::alert_type: {
@@ -76,7 +86,7 @@ static void process_available_alerts() {
             cs_client_performance_alert perf_warning{};
             perf_warning.warning_type = perf_alert->warning_code;
             fill_event_info(&perf_warning.alert, alert, cs_alert_type::alert_client_performance, message);
-            g_callback(&perf_warning);
+            handler->callback(&perf_warning);
             break;
         }
         case lt::peer_connect_alert::alert_type: {
@@ -85,105 +95,116 @@ static void process_available_alerts() {
                 ? cs_peer_alert_type::connected_in : cs_peer_alert_type::connected_out;
             cs_peer_alert peer_connected{};
             populate_peer_alert(&peer_connected, peer_alert, direction, message);
-            g_callback(&peer_connected);
+            handler->callback(&peer_connected);
             break;
         }
         case lt::peer_disconnected_alert::alert_type: {
             auto* peer_alert = lt::alert_cast<lt::peer_disconnected_alert>(alert);
             cs_peer_alert peer_disconnected{};
             populate_peer_alert(&peer_disconnected, peer_alert, cs_peer_alert_type::disconnected, message);
-            g_callback(&peer_disconnected);
+            handler->callback(&peer_disconnected);
             break;
         }
         case lt::peer_ban_alert::alert_type: {
             auto* peer_alert = lt::alert_cast<lt::peer_ban_alert>(alert);
             cs_peer_alert peer_banned{};
             populate_peer_alert(&peer_banned, peer_alert, cs_peer_alert_type::banned, message);
-            g_callback(&peer_banned);
+            handler->callback(&peer_banned);
             break;
         }
         case lt::peer_snubbed_alert::alert_type: {
             auto* peer_alert = lt::alert_cast<lt::peer_snubbed_alert>(alert);
             cs_peer_alert peer_snubbed{};
             populate_peer_alert(&peer_snubbed, peer_alert, cs_peer_alert_type::snubbed, message);
-            g_callback(&peer_snubbed);
+            handler->callback(&peer_snubbed);
             break;
         }
         case lt::peer_unsnubbed_alert::alert_type: {
             auto* peer_alert = lt::alert_cast<lt::peer_unsnubbed_alert>(alert);
             cs_peer_alert peer_unsnubbed{};
             populate_peer_alert(&peer_unsnubbed, peer_alert, cs_peer_alert_type::unsnubbed, message);
-            g_callback(&peer_unsnubbed);
+            handler->callback(&peer_unsnubbed);
             break;
         }
         case lt::peer_error_alert::alert_type: {
             auto* peer_alert = lt::alert_cast<lt::peer_error_alert>(alert);
             cs_peer_alert peer_errored{};
             populate_peer_alert(&peer_errored, peer_alert, cs_peer_alert_type::errored, message);
-            g_callback(&peer_errored);
+            handler->callback(&peer_errored);
             break;
         }
         default: {
-            if (!g_include_unmapped) break;
+            if (!handler->include_unmapped) break;
             cs_alert generic_alert{};
             fill_event_info(&generic_alert, alert, cs_alert_type::alert_generic, message);
-            g_callback(&generic_alert);
+            handler->callback(&generic_alert);
             break;
         }
         }
     }
 }
 
-// hilo persistente que procesa alertas
-static void alert_thread_func() {
-    while (g_alert_running) {
-        std::unique_lock<std::mutex> lock(g_alert_mutex);
-        g_alert_cv.wait(lock, [] { return g_alert_notify_flag || !g_alert_running; });
-        g_alert_notify_flag = false;
+// Hilo persistente para un handler específico
+static void alert_thread_func(cs_event_handler* handler) {
+    while (handler->running) {
+        std::unique_lock<std::mutex> lock(handler->mtx);
+        handler->cv.wait(lock, [handler] { return handler->notify_flag || !handler->running; });
+        handler->notify_flag = false;
         lock.unlock();
 
-        if (!g_alert_running) break;
-
-        process_available_alerts();
+        if (!handler->running) break;
+        process_alerts(handler);
     }
 }
 
-// ─── API pública para el sistema de eventos ────────────────────────────────
-void cs_set_event_callback(lt::session* session, cs_alert_callback callback, bool include_unmapped) {
-    if (!session) return;
+// ─── API pública del nuevo sistema por sesión ───────────────────────────
+cs_event_handle cs_create_event_handler(lt::session* session, cs_alert_callback callback, bool include_unmapped) {
+    if (!session || !callback) return nullptr;
 
-    // detener cualquier hilo anterior
-    if (g_alert_running) {
-        g_alert_running = false;
-        g_alert_cv.notify_one();
-        if (g_alert_thread.joinable()) g_alert_thread.join();
+    std::lock_guard<std::mutex> lock(g_handlers_mutex);
+    // Si ya hay un handler para esta sesión, lo destruimos primero
+    auto it = g_handlers.find(session);
+    if (it != g_handlers.end()) {
+        cs_destroy_event_handler(it->second.get());
+        g_handlers.erase(it);
     }
 
-    if (callback == nullptr) {
-        // si callback es nulo, solo limpiamos y no creamos hilo
-        session->set_alert_notify(nullptr);
-        g_session = nullptr;
-        g_callback = nullptr;
-        return;
-    }
+    auto handler = std::make_unique<cs_event_handler>();
+    handler->session = session;
+    handler->callback = callback;
+    handler->include_unmapped = include_unmapped;
+    handler->running = true;
 
-    // configurar nuevo hilo
-    g_session = session;
-    g_callback = callback;
-    g_include_unmapped = include_unmapped;
-    g_alert_running = true;
+    // Capturamos el puntero crudo para el notificador
+    auto* handler_ptr = handler.get();
+    handler->thread = std::thread(alert_thread_func, handler_ptr);
 
-    g_alert_thread = std::thread(alert_thread_func);
-
-    // el notificador solo despierta al hilo persistente
-    session->set_alert_notify([session]() {
-        std::lock_guard<std::mutex> lock(g_alert_mutex);
-        g_alert_notify_flag = true;
-        g_alert_cv.notify_one();
+    session->set_alert_notify([handler_ptr]() {
+        std::lock_guard<std::mutex> lock(handler_ptr->mtx);
+        handler_ptr->notify_flag = true;
+        handler_ptr->cv.notify_one();
         });
+
+    g_handlers[session] = std::move(handler);
+    return handler_ptr;
 }
 
-void cs_clear_event_callback(lt::session* session) {
-    // lo mismo que detener todo
-    cs_set_event_callback(session, nullptr, false);
+void cs_destroy_event_handler(cs_event_handle handle) {
+    if (!handle) return;
+    handle->running = false;
+    handle->cv.notify_one();
+    if (handle->thread.joinable())
+        handle->thread.join();
+    if (handle->session)
+        handle->session->set_alert_notify(nullptr);
+}
+
+void cs_destroy_event_handler_for_session(lt::session* session) {
+    if (!session) return;
+    std::lock_guard<std::mutex> lock(g_handlers_mutex);
+    auto it = g_handlers.find(session);
+    if (it != g_handlers.end()) {
+        cs_destroy_event_handler(it->second.get());
+        g_handlers.erase(it);
+    }
 }

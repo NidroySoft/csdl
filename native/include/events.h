@@ -22,76 +22,75 @@
 #include <libtorrent/torrent_handle.hpp>
 
 // used internally in main library, not intended for public use
-typedef void (CALL_CONV *cs_alert_callback)(void *alert);
+typedef void (CALL_CONV* cs_alert_callback)(void* alert);
 
-CSDL_NO_EXPORT void on_events_available(lt::session *session, cs_alert_callback callback, bool include_unmapped);
-// events.h (al final, fuera de extern "C")
-void cs_set_event_callback(lt::session* session, cs_alert_callback callback, bool include_unmapped);
-void cs_clear_event_callback(lt::session* session);
+// ─── Tipo opaco para el manejador de eventos por sesión ─────────────
+struct cs_event_handler;
+typedef struct cs_event_handler* cs_event_handle;
+
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-enum cs_alert_type : int32_t {
-    alert_generic = 0,
-    alert_torrent_status = 1,
-    alert_client_performance = 2,
-    alert_peer_notification = 3,
-    alert_torrent_removed = 4
-};
+    enum cs_alert_type : int32_t {
+        alert_generic = 0,
+        alert_torrent_status = 1,
+        alert_client_performance = 2,
+        alert_peer_notification = 3,
+        alert_torrent_removed = 4
+    };
 
-// base format for all alerts
-struct CSDL_STRUCT cs_alert {
-    cs_alert_type type;
+    struct CSDL_STRUCT cs_alert {
+        cs_alert_type type;
+        int32_t category;
+        int64_t epoch;
+        const char* message;
+    };
 
-    int32_t category;
-    int64_t epoch;
+    struct CSDL_STRUCT cs_torrent_status_alert {
+        cs_alert alert;
+        uint32_t old_state;
+        uint32_t new_state;
+        char info_hash[20];
+    };
 
-    const char *message;
-};
+    struct CSDL_STRUCT cs_torrent_remove_alert {
+        cs_alert alert;
+        char info_hash[20];
+    };
 
-struct CSDL_STRUCT cs_torrent_status_alert {
-    cs_alert alert;
+    struct CSDL_STRUCT cs_client_performance_alert {
+        cs_alert alert;
+        uint8_t warning_type;
+    };
 
-    uint32_t old_state;
-    uint32_t new_state;
+    enum cs_peer_alert_type : uint8_t {
+        connected_in = 0,
+        connected_out = 1,
+        disconnected = 2,
+        banned = 3,
+        snubbed = 4,
+        unsnubbed = 5,
+        errored = 6
+    };
 
-    char info_hash[20];
-};
-
-struct CSDL_STRUCT cs_torrent_remove_alert {
-    cs_alert alert;
-
-    char info_hash[20];
-};
-
-struct CSDL_STRUCT cs_client_performance_alert {
-    cs_alert alert;
-
-    uint8_t warning_type;
-};
-
-enum cs_peer_alert_type : uint8_t {
-    connected_in = 0,
-    connected_out = 1,
-    disconnected = 2,
-    banned = 3,
-    snubbed = 4,
-    unsnubbed = 5,
-    errored = 6
-};
-
-struct CSDL_STRUCT cs_peer_alert {
-    cs_alert alert;
-
-    lt::torrent_handle *handle;
-    cs_peer_alert_type type;
-
-    char info_hash[20];
-    char ipv6_address[16];
-};
+    struct CSDL_STRUCT cs_peer_alert {
+        cs_alert alert;
+        lt::torrent_handle* handle;
+        cs_peer_alert_type type;
+        char info_hash[20];
+        char ipv6_address[16];
+    };
 
 #ifdef __cplusplus
 }
 #endif
+
+// ─── Funciones internas (C++ linkage) – usadas por library.cpp ──────
+CSDL_NO_EXPORT void on_events_available(lt::session* session, cs_alert_callback callback, bool include_unmapped);
+
+cs_event_handle cs_create_event_handler(lt::session* session, cs_alert_callback callback, bool include_unmapped);
+void cs_destroy_event_handler(cs_event_handle handle);
+void cs_destroy_event_handler_for_session(lt::session* session);
+
 #endif //CS_NATIVE_EVENTS_H
