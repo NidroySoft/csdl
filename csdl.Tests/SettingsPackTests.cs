@@ -31,8 +31,11 @@ namespace csdl.Tests
             var pack = new SettingsPack();
             pack.Set("invalid_data", 100);
 
-            Assert.Throws<ArgumentException>(() => pack.Get<bool>("invalid_data"));
-            Assert.Throws<ArgumentException>(() => pack.BuildNative());
+            var ex1 = Assert.Throws<ArgumentException>(() => pack.Get<bool>("invalid_data"));
+            Assert.Contains("expected Boolean", ex1.Message); // Confirmamos el mensaje corregido
+
+            var ex2 = Assert.Throws<ArgumentException>(() => pack.BuildNative());
+            Assert.Contains("Failed to set key", ex2.Message);
         }
 
         [Fact]

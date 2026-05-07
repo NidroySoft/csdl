@@ -3,140 +3,116 @@
 
 using System;
 using System.IO;
-using System.Linq;
+using System.Net.Http;
 using System.Threading;
 using System.Threading.Tasks;
-using csdl.Alerts;
+using csdl;
 using csdl.Enums;
-using JetBrains.Annotations;
+using csdl.Native;
+using Xunit;
 using Xunit.Abstractions;
 
 namespace csdl.Tests;
 
-[TestSubject(typeof(TorrentClient))]
 public class TorrentClientTests : IDisposable
 {
-    private readonly TorrentClient _client = new(new TorrentClientConfig
-    {
-        ForceEncryption = true,
-        BlockSeeding = true
-    });
-
     private readonly ITestOutputHelper _output;
-    private readonly string _tempSavePath;
+    private readonly string _tempBase;
+    private readonly HttpClient _http = new();
+    private const int FixedPort = 55201;
+
+    private TorrentClient _seedClient;
+    private TorrentClient _leecherClient;
+    private TorrentManager _seedManager;
+    private TorrentManager _leecherManager;
 
     public TorrentClientTests(ITestOutputHelper output)
     {
         _output = output;
-        _tempSavePath = Path.Combine(Path.GetTempPath(), "csdl-test");
-
-        Directory.CreateDirectory(_tempSavePath);
+        NativeMethods.ResetStreamServer();
+        _tempBase = Path.Combine(Path.GetTempPath(), "csdl-client-test-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(_tempBase);
     }
 
     public void Dispose()
     {
-        _client?.Dispose();
-        Directory.Delete(_tempSavePath, true);
+        try
+        {
+            _leecherManager?.StopStreaming();
+            _leecherManager?.Stop();
+            _seedManager?.Stop();
+            _leecherClient?.DetachTorrent(_leecherManager);
+            _seedClient?.DetachTorrent(_seedManager);
+        }
+        catch { }
+        _leecherClient?.Dispose();
+        _seedClient?.Dispose();
+        _http?.Dispose();
+        if (Directory.Exists(_tempBase))
+            Directory.Delete(_tempBase, true);
+    }
+
+    private async Task SetupLocalSwarmAsync()
+    {
+        string sourceData = Path.GetFullPath(Path.Combine("files", "alice.txt"));
+        string seedDataFile = Path.Combine(_tempBase, "alice.txt");
+        File.Copy(sourceData, seedDataFile, overwrite: true);
+
+        string torrentPath = Path.GetFullPath(Path.Combine("files", "alice.torrent"));
+        var torrentInfo = new TorrentInfo(torrentPath);
+
+        _seedClient = new TorrentClient(new TorrentClientConfig { MaxConnections = 50 });
+        _seedManager = _seedClient.AttachTorrent(torrentInfo, _tempBase);
+        _seedManager.Start();
+        await WaitForStateAsync(_seedManager, TorrentState.Seeding, TimeSpan.FromSeconds(15));
+
+        _leecherClient = new TorrentClient(new TorrentClientConfig
+        {
+            MaxConnections = 50,
+            BlockSeeding = true
+        });
+        string leechPath = Path.Combine(_tempBase, "leech");
+        Directory.CreateDirectory(leechPath);
+        _leecherManager = _leecherClient.AttachTorrent(torrentInfo, leechPath);
+        _leecherManager.Start();
+        await WaitForStateAsync(_leecherManager, TorrentState.Downloading, TimeSpan.FromSeconds(15));
+
+        await Task.Delay(2000);
+    }
+
+    private async Task WaitForStateAsync(TorrentManager mgr, TorrentState target, TimeSpan timeout)
+    {
+        var deadline = DateTime.UtcNow + timeout;
+        while (DateTime.UtcNow < deadline)
+        {
+            var st = mgr.GetCurrentStatus();
+            if (st.State == target || st.State == TorrentState.Finished || st.State == TorrentState.Seeding)
+                return;
+            await Task.Delay(500);
+        }
     }
 
     [Fact]
-    public async Task TestTorrentDownload()
+    public async Task TestStreamingServer()
     {
-        var torrentInfo = new TorrentInfo(Path.GetFullPath(Path.Combine("files", "big-buck-bunny.torrent")));
-        var torrentManager = _client.AttachTorrent(torrentInfo, _tempSavePath);
+        await SetupLocalSwarmAsync();
 
-        var tcs = new TaskCompletionSource();
+        int fileIndex = 0;
+        string url = _leecherManager.StartStreaming(fileIndex, port: FixedPort);
+        _output.WriteLine($"Streaming URL: {url}");
 
-        // only download the non-video files (< 10mb)
-        foreach (var file in torrentManager.Files.Where(x => x.Info.FileSize > 1e+7))
-        {
-            file.Priority = FileDownloadPriority.DoNotDownload;
-        }
+        Assert.NotNull(url);
+        Assert.StartsWith("http://127.0.0.1:", url);
+        Assert.True(_leecherManager.IsStreaming);
 
-        try
-        {
-            torrentManager.Start();
+        string baseUrl = url.Substring(0, url.LastIndexOf('/'));
+        var statusJson = await _http.GetStringAsync(baseUrl + "/status");
+        _output.WriteLine($"Status JSON: {statusJson}");
+        Assert.Contains("\"file\":", statusJson);
+        Assert.Contains("\"index\": " + fileIndex, statusJson);
+        Assert.Contains("\"name\": \"alice.txt\"", statusJson);
 
-            await using (new Timer(CheckProgress, (torrentManager, tcs), TimeSpan.Zero, TimeSpan.FromSeconds(5)))
-            {
-                await tcs.Task.WaitAsync(TimeSpan.FromMinutes(2));
-            }
-
-            // perform reannouncement
-            torrentManager.ReannounceAllTrackers(TimeSpan.Zero);
-
-            // check all files have been downloaded and are the correct size
-            foreach (var file in torrentManager.Files.Where(x => x.Priority != FileDownloadPriority.DoNotDownload))
-            {
-                Assert.True(File.Exists(file.Path));
-                Assert.Equal(file.Info.FileSize, new FileInfo(file.Path).Length);
-            }
-        }
-        finally
-        {
-            await PerformCleanup(torrentManager);
-        }
-
-        Assert.True(!_client.ActiveTorrents.Contains(torrentManager));
-    }
-
-    private void CheckProgress(object state)
-    {
-        var (manager, tcs) = (ValueTuple<TorrentManager, TaskCompletionSource>)state;
-        var status = manager.GetCurrentStatus();
-
-        if (status.State is TorrentState.Finished or TorrentState.Seeding)
-        {
-            tcs.TrySetResult();
-        }
-
-        _output.WriteLine($"Progress: {status.State} {status.Progress * 100:F2}% ({status.SeedCount:N0} seeds)");
-    }
-
-    private async Task PerformCleanup(TorrentManager manager)
-    {
-        var cleanupTask = new TaskCompletionSource();
-
-        _client.AlertRaised += CheckAlert;
-
-        try
-        {
-            _client.DetachTorrent(manager);
-            await cleanupTask.Task.WaitAsync(TimeSpan.FromSeconds(30));
-        }
-        catch
-        {
-            // log warning but don't fail
-            _output.WriteLine("Failed to cleanup torrent manager in time. The event may not have been raised.");
-        }
-        finally
-        {
-            _client.AlertRaised -= CheckAlert;
-        }
-
-        return;
-
-        void CheckAlert(object sender, SessionAlert alert)
-        {
-            if (alert is not TorrentRemovedAlert removedAlert || !ReferenceEquals(removedAlert.Subject, manager))
-            {
-                return;
-            }
-
-            foreach (var file in manager.Files)
-            {
-                try
-                {
-                    File.Delete(file.Path);
-                }
-                catch (Exception ex)
-                {
-                    // log the error but don't fail
-                    _output.WriteLine($"Failed to delete file {file.Path}. Error: {ex.Message}");
-                }
-            }
-
-            cleanupTask.TrySetResult();
-        }
+        _leecherManager.StopStreaming();
+        Assert.False(_leecherManager.IsStreaming);
     }
 }

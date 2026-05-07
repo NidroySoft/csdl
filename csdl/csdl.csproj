@@ -11,33 +11,45 @@
         <Title>csdl</Title>
         <PackageId>csdl</PackageId>
         <IsPackable>true</IsPackable>
-        <Authors>Albie Spriddell</Authors>
-        <Description>A .NET wrapper for libtorrent.</Description>
+        <!-- Autores originales y contribuidores -->
+        <Authors>Albie Spriddell, NidroySoft</Authors>
+        <Description>
+            A cross-platform .NET wrapper for libtorrent with embedded HTTP streaming server.
+            Supports Windows, Linux, macOS and Android.
+            Features: sequential download, peer resilience, and embedded streaming server with seek prioritization.
+        </Description>
 
         <PackageIcon>icon.png</PackageIcon>
-        <PackageTags>libtorrent, torrent, csdl</PackageTags>
+        <PackageTags>libtorrent, torrent, streaming, bittorrent, csdl</PackageTags>
         <PackageReadmeFile>docs/readme.md</PackageReadmeFile>
         <PackageLicenseExpression>Apache-2.0</PackageLicenseExpression>
 
         <IncludeSymbols>true</IncludeSymbols>
         <SymbolPackageFormat>snupkg</SymbolPackageFormat>
 
+        <!-- Repositorio original (se mantiene el crédito al proyecto base) -->
         <RepositoryType>Git</RepositoryType>
         <RepositoryUrl>https://github.com/aspriddell/csdl</RepositoryUrl>
         <PackageProjectUrl>https://github.com/aspriddell/csdl</PackageProjectUrl>
+
+        <!-- Versión mejorada por NidroySoft -->
+        <Version>2.2.1</Version>
     </PropertyGroup>
 
     <ItemGroup>
-        <None Include="..\icon.png" Pack="true" PackagePath="." Visible="false"/>
-        <None Include="..\readme.md" Pack="true" PackagePath="docs" Visible="false"/>
-    </ItemGroup>
-    
-    <ItemGroup>
-        <InternalsVisibleTo Include="csdl.Tests"/>
-    </ItemGroup>
-    
-    <ItemGroup>
-      <PackageReference Include="csdl.Native" Version="1.2.2" />
+        <None Include="..\icon.png" Pack="true" PackagePath="." Visible="false" />
+        <None Include="..\readme.md" Pack="true" PackagePath="docs" Visible="false" />
     </ItemGroup>
 
+    <ItemGroup>
+        <InternalsVisibleTo Include="csdl.Tests" />
+    </ItemGroup>
+
+	<ItemGroup>
+		<Content Include="..\build_static_md_final\csdl.dll"
+				 PackagePath="runtimes\win-x64\native\csdl.dll"
+				 Pack="true"
+				 CopyToOutputDirectory="PreserveNewest"
+				 Visible="false" />
+	</ItemGroup>
 </Project>

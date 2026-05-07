@@ -132,7 +132,7 @@ public class TorrentInfo
                 info.comment,
                 info.total_files,
                 info.total_size,
-                DateTimeOffset.FromUnixTimeSeconds(info.creation_epoch),
+                SafeFromUnixTimeSeconds(info.creation_epoch),
                 info.info_hash_sha1.All(b => b == 0) ? null : Convert.ToHexString(info.info_hash_sha1),
                 info.info_hash_sha256.All(b => b == 0) ? null : Convert.ToHexString(info.info_hash_sha256));
         }
@@ -170,5 +170,19 @@ public class TorrentInfo
         {
             NativeMethods.FreeTorrentFileList(ref list);
         }
+    }
+    /// <summary>
+    /// Convierte de forma segura un timestamp Unix a DateTimeOffset.
+    /// Si el valor está fuera del rango válido, devuelve UnixEpoch.
+    /// </summary>
+    private static DateTimeOffset SafeFromUnixTimeSeconds(long seconds)
+    {
+        const long min = -62135596800; // DateTimeOffset.MinValue en segundos Unix
+        const long max = 253402300799; // DateTimeOffset.MaxValue en segundos Unix
+
+        if (seconds >= min && seconds <= max)
+            return DateTimeOffset.FromUnixTimeSeconds(seconds);
+
+        return DateTimeOffset.UnixEpoch; // Valor por defecto seguro
     }
 }

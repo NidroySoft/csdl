@@ -49,21 +49,19 @@ public class SettingsPack
     public T? Get<T>(string key) where T : struct
     {
         if (typeof(T) != typeof(bool) && typeof(T) != typeof(int))
-        {
             throw new ArgumentException("Only bool and int types are supported");
-        }
 
         var value = _dictionary[key];
         switch (value)
         {
             case T casted:
                 return casted;
-
             case null:
                 return null;
-
             default:
-                throw new ArgumentException($"Type mismatch, expected {value.GetType().Name}, got {typeof(T).Name}");
+                // Mensaje corregido: expected (lo que pediste), got (lo que hay)
+                throw new ArgumentException(
+                    $"Type mismatch for key '{key}': expected {typeof(T).Name}, got {value.GetType().Name}");
         }
     }
 

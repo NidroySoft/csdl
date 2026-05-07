@@ -256,4 +256,57 @@ internal static partial class NativeMethods
     public static partial bool SettingsPackSetString(IntPtr settingsPack, string key, string value);
 
     #endregion
+
+    #region Streaming Server
+
+    /// <summary>
+    /// Starts an embedded HTTP streaming server for a specific file within a torrent.
+    /// </summary>
+    /// <param name="torrentSessionHandle">The torrent-session handle (from <see cref="AttachTorrent"/>).</param>
+    /// <param name="fileIndex">Index of the file to stream within the torrent.</param>
+    /// <param name="port">Port to bind on. Pass 0 to auto-assign.</param>
+    /// <returns>
+    /// A pointer to a UTF-8 string containing the base URL (e.g. "http://127.0.0.1:55126/"),
+    /// or <see cref="IntPtr.Zero"/> on failure. The string is owned by the native library —
+    /// do not free it. Valid until <see cref="StopStreamServer"/> is called.
+    /// </returns>
+    [LibraryImport(LibraryName, EntryPoint = "start_stream_server")]
+    public static partial IntPtr StartStreamServer(IntPtr torrentSessionHandle, int fileIndex, int port);
+
+    /// <summary>
+    /// Stops the embedded streaming server and releases its resources.
+    /// Must be called before starting a new streaming session.
+    /// </summary>
+    [LibraryImport(LibraryName, EntryPoint = "stop_stream_server")]
+    public static partial void StopStreamServer();
+
+    /// <summary>
+    /// Returns true if the embedded streaming server is currently running.
+    /// </summary>
+    [return: MarshalAs(UnmanagedType.I1)]
+    [LibraryImport(LibraryName, EntryPoint = "is_stream_server_running")]
+    public static partial bool IsStreamServerRunning();
+
+    /// <summary>
+    /// Reinicia completamente el estado del servidor de streaming embebido.
+    /// Útil si el servidor queda en estado inconsistente por errores de red extremos.
+    /// </summary>
+    [DllImport(LibraryName, EntryPoint = "reset_stream_server", CallingConvention = CallingConvention.Cdecl)]
+    public static extern void ResetStreamServer();
+    [DllImport(LibraryName, EntryPoint = "get_last_stream_error", CallingConvention = CallingConvention.Cdecl)]
+    public static extern IntPtr GetLastStreamError();
+
+    [DllImport(LibraryName, EntryPoint = "get_piece_length", CallingConvention = CallingConvention.Cdecl)]
+    public static extern int GetPieceLength(IntPtr torrentHandle);
+
+    // ── Seek inteligente ─────────────────────────────────────────────────────
+    [DllImport(LibraryName, EntryPoint = "is_byte_available_impl", CallingConvention = CallingConvention.Cdecl)]
+    [return: MarshalAs(UnmanagedType.I1)]
+    public static extern bool IsByteAvailable(IntPtr torrentHandle, int fileIndex, long bytePosition);
+
+    [DllImport(LibraryName, EntryPoint = "prioritize_seek_range_impl", CallingConvention = CallingConvention.Cdecl)]
+    [return: MarshalAs(UnmanagedType.I1)]
+    public static extern bool PrioritizeSeekRange(IntPtr torrentHandle, int fileIndex, long bytePosition, long pieceSize);
+    #endregion
+
 }
