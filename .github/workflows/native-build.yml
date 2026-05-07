@@ -37,9 +37,6 @@ jobs:
             - { targetname: linux, buildos: ubuntu-22.04, arch: arm64, triplet: release-linux-arm64 }
             - { targetname: windows, buildos: windows-latest, arch: x64, triplet: x64-windows-release }
             - { targetname: windows, buildos: windows-latest,  arch: arm64, triplet: release-windows-arm64 }
-            - { targetname: android, buildos: ubuntu-22.04, arch: arm, triplet: release-android-arm }
-            - { targetname: android, buildos: ubuntu-22.04, arch: arm64, triplet: release-android-arm64 }
-            - { targetname: android, buildos: ubuntu-22.04, arch: x64, triplet: release-android-x64 }
 
       steps:
         - name: Checkout
@@ -54,46 +51,36 @@ jobs:
             sudo apt-get update
             sudo apt-get install -y binutils-aarch64-linux-gnu g++-12-aarch64-linux-gnu gcc-12-aarch64-linux-gnu
 
-        - name: Prepare Environment (Android)
-          if: matrix.targetname == 'android'
-          uses: nttld/setup-ndk@v1
-          id: setup-ndk
-          with:
-            ndk-version: r27c
-            add-to-path: false
-
         - name: Prepare Environment (macOS)
           if: matrix.buildos == 'macos-latest'
           run: brew install ninja
 
         - name: Setup VCPKG
           uses: lukka/run-vcpkg@v11
+          env:
+            VCPKG_BINARY_SOURCES: clear   # Desactiva la caché GHA para evitar el error de tokens
 
         - name: Setup CMake (Linux)
           if: matrix.targetname == 'linux'
           run: cmake -B ${{ env.BUILD_DIR }} -S . -DVCPKG_OVERLAY_TRIPLETS=${{ env.TRIPLETS_DIR }} -DVCPKG_TARGET_TRIPLET=${{ matrix.triplet }}
           env:
             CMAKE_TOOLCHAIN_FILE: ${{ github.workspace }}/native/build/linux-${{ matrix.arch }}.cmake
-
-        - name: Setup CMake (Android)
-          if: matrix.targetname == 'android'
-          run: cmake -B ${{ env.BUILD_DIR }} -S . -DVCPKG_OVERLAY_TRIPLETS=${{ env.TRIPLETS_DIR }} -DVCPKG_TARGET_TRIPLET=${{ matrix.triplet }}
-          env:
-            CMAKE_TOOLCHAIN_FILE: ${{ github.workspace }}/native/build/android-${{ matrix.arch }}.cmake            
-            ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+            VCPKG_BINARY_SOURCES: clear
 
         - name: Setup CMake (Windows)
           if: matrix.targetname == 'windows'
           run: cmake -B ${{ env.BUILD_DIR }} -G "Visual Studio 17 2022" -A ${{ matrix.arch == 'arm64' && 'ARM64' || 'x64' }} -S . -DVCPKG_OVERLAY_TRIPLETS=${{ env.TRIPLETS_DIR }} -DVCPKG_TARGET_TRIPLET=${{ matrix.triplet }}
           env:
             CMAKE_TOOLCHAIN_FILE: ${{ env.VCPKG_ROOT }}/scripts/buildsystems/vcpkg.cmake
-              
+            VCPKG_BINARY_SOURCES: clear
+
         - name: Setup CMake (macOS)
           if: matrix.targetname == 'osx'
           run: cmake -B ${{ env.BUILD_DIR }} -G "Xcode" -S . -DVCPKG_OVERLAY_TRIPLETS=${{ env.TRIPLETS_DIR }} -DVCPKG_TARGET_TRIPLET=${{ matrix.triplet }}
           env:
             CMAKE_TOOLCHAIN_FILE: ${{ env.VCPKG_ROOT }}/scripts/buildsystems/vcpkg.cmake
             CMAKE_OSX_ARCHITECTURES: ${{ matrix.arch == 'arm64' && 'arm64' || 'x86_64' }}
+            VCPKG_BINARY_SOURCES: clear
 
         - name: Build
           run: cmake --build ${{ env.BUILD_DIR }} --config Release
@@ -107,12 +94,6 @@ jobs:
             cp ${{ env.BUILD_DIR }}/libcsdl.so ${{ env.ARCHIVE_DIR }}
             cp ${{ env.BUILD_DIR }}/vcpkg_installed/${{ matrix.triplet }}/lib/libtorrent-rasterbar.so ${{ env.ARCHIVE_DIR }}/libtorrent-rasterbar.so.2.0
 
-        - name: Prepare Files (Android)
-          if: matrix.targetname == 'android'
-          run: |
-            ${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip --strip-unneeded -x ${{ env.BUILD_DIR }}/libcsdl.so
-            cp ${{ env.BUILD_DIR }}/libcsdl.so ${{ env.ARCHIVE_DIR }}
-        
         - name: Prepare Files (macOS)
           if: matrix.targetname == 'osx'
           run: |
@@ -169,44 +150,6 @@ jobs:
 
       - name: Build Package
         run: dotnet pack -c Release -p:Version=${{ github.event.inputs.version }} -o ./packages native/nuget
-
-      - name: Publish Package (NuGet)
-        if: github.event.inputs.nuget == 'true'
-        run: dotnet nuget push -s https://api.nuget.org/v3/index.json --skip-duplicate -k ${{ secrets.NUGET_KEY }} ./packages/*.nupkg
-
-      - name: Publish Package (GitHub)
-        if: github.event.inputs.nuget != 'true'
-        run: dotnet nuget push -s https://nuget.pkg.github.com/${{ github.repository_owner }}/index.json --skip-duplicate -k ${{ github.token }} ./packages/*.nupkg
-        
-  package-android:
-    name: Build Package (Android)
-    runs-on: ubuntu-latest
-
-    needs: [build-platforms]
-
-    steps:
-      - uses: actions/setup-dotnet@v4
-        with:
-          dotnet-version: '8.0.x'
-      
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
-        with:
-          name: android-x64
-          path: native/nuget-android/runtimes/android-x64/native
-
-      - uses: actions/download-artifact@v4
-        with:
-          name: android-arm
-          path: native/nuget-android/runtimes/android-arm/native
-
-      - uses: actions/download-artifact@v4
-        with:
-          name: android-arm64
-          path: native/nuget-android/runtimes/android-arm64/native
-
-      - name: Build Package
-        run: dotnet pack -c Release -p:Version=${{ github.event.inputs.version }} -o ./packages native/nuget-android
 
       - name: Publish Package (NuGet)
         if: github.event.inputs.nuget == 'true'
