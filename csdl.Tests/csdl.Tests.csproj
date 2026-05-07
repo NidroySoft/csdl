@@ -21,15 +21,28 @@
     </ItemGroup>
 
     <ItemGroup>
-        <Using Include="Xunit"/>
+        <Using Include="Xunit" />
     </ItemGroup>
 
     <ItemGroup>
-        <ProjectReference Include="..\csdl\csdl.csproj"/>
+        <ProjectReference Include="..\csdl\csdl.csproj" />
     </ItemGroup>
 
     <ItemGroup>
-        <None Include="files\*.torrent" CopyToOutputDirectory="Always"/>
+        <None Include="files\*.torrent" CopyToOutputDirectory="Always" />
     </ItemGroup>
 
+    <ItemGroup>
+      <None Update="files\alice.torrent">
+        <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      </None>
+      <None Update="files\alice.txt">
+        <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      </None>
+    </ItemGroup>	
+	<ItemGroup>
+		<None Update="xunit.runner.json">
+			<CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+		</None>
+	</ItemGroup>	
 </Project>

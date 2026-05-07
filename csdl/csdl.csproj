@@ -45,7 +45,7 @@
         <InternalsVisibleTo Include="csdl.Tests" />
     </ItemGroup>
 
-	<ItemGroup>
+	<ItemGroup Condition="Exists('..\build_static_md_final\csdl.dll')">
 		<Content Include="..\build_static_md_final\csdl.dll"
 				 PackagePath="runtimes\win-x64\native\csdl.dll"
 				 Pack="true"
