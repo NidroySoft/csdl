@@ -11,5 +11,11 @@
       "name": "magic-enum",
       "version>=": "0.9.7"
     }
+  ],
+  "overrides": [
+    {
+      "name": "boost-uninstall",
+      "version": "1.87.0"
+    }
   ]
 }
