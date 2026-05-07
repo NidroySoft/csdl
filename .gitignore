@@ -467,3 +467,5 @@ fabric.properties
 .idea/
 cmake-build-*/
 vcpkg_installed/
+build/
+build_static_md_final/
