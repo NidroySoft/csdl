@@ -22,6 +22,8 @@ extern "C" {
     CSDL_EXPORT uint8_t settings_pack_set_bool(lt::settings_pack* pack, const char* key, uint8_t value);
     CSDL_EXPORT uint8_t settings_pack_set_int(lt::settings_pack* pack, const char* key, int value);
 
+    CSDL_EXPORT lt::settings_pack* create_streaming_settings();
+
 #ifdef __cplusplus
 }
 #endif

@@ -25,7 +25,9 @@
 typedef void (CALL_CONV *cs_alert_callback)(void *alert);
 
 CSDL_NO_EXPORT void on_events_available(lt::session *session, cs_alert_callback callback, bool include_unmapped);
-
+// events.h (al final, fuera de extern "C")
+void cs_set_event_callback(lt::session* session, cs_alert_callback callback, bool include_unmapped);
+void cs_clear_event_callback(lt::session* session);
 #ifdef __cplusplus
 extern "C" {
 #endif
