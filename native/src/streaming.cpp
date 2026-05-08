@@ -1,6 +1,7 @@
 // streaming.cpp – Servidor de streaming profesional con libtorrent 2.0 y cpp-httplib
-// Versión definitiva para producción: caché RAM prioritaria, readahead en MB,
-// precarga configurable, sin deadlocks, uso de alert_when_available, robustez total.
+// Versión final: precarga mínima (primera y última pieza), readahead dinámico,
+// priorización reactiva en cada Range, timeouts desactivados, caché LRU en RAM.
+
 #include "streaming.h"
 #include <libtorrent/torrent_handle.hpp>
 #include <libtorrent/torrent_status.hpp>
@@ -56,14 +57,11 @@ namespace cs_stream {
     constexpr int PIECE_DEADLINE_MAX_MS = 8000;    // plazo máximo absoluto
     constexpr int PIECE_POLL_INTERVAL_MS = 50;      // intervalo de sondeo
     constexpr int DEADLINE_UPDATE_INTERVAL_MS = 500;   // refresco de deadlines
-    constexpr int64_t READAHEAD_MB = 16;      // referencia, el real es porcentaje de caché
     constexpr size_t CACHE_MAX_MB = 64;
     constexpr size_t CACHE_MAX_BYTES = CACHE_MAX_MB * 1024 * 1024;
     constexpr int READAHEAD_PERCENT = 25;      // % de la caché para read‑ahead
     constexpr size_t READAHEAD_BYTES = CACHE_MAX_BYTES * READAHEAD_PERCENT / 100;
-    constexpr int PRELOAD_PERCENT = 5;       // % de caché a precargar antes de iniciar el servidor (0 = sin espera)
-    constexpr size_t PRELOAD_BYTES = CACHE_MAX_BYTES * PRELOAD_PERCENT / 100;
-    constexpr int PRECARGA_TIMEOUT_SEC = 30;      // timeout máximo para la precarga
+    constexpr int PRECARGA_TIMEOUT_SEC = 30;      // tiempo máximo esperando primera y última pieza
 
     // ── Estado global ──────────────────────────────────────────────────
     static std::mutex            g_state_mutex;
@@ -227,7 +225,7 @@ namespace cs_stream {
     }
 
     // ═══════════════════════════════════════════════════════════════════
-    // TorrentContentProvider – Versión profesional con alert_when_available
+    // TorrentContentProvider – Versión profesional con priorización por Range
     // ═══════════════════════════════════════════════════════════════════
     class TorrentContentProvider {
     public:
@@ -254,6 +252,7 @@ namespace cs_stream {
                 readahead_pieces_ = 1;
             }
             last_deadline_update_ = std::chrono::steady_clock::now() - std::chrono::milliseconds(DEADLINE_UPDATE_INTERVAL_MS * 2);
+            last_range_start_ = 0;
         }
 
         ~TorrentContentProvider() { close_file(); }
@@ -262,6 +261,13 @@ namespace cs_stream {
             try {
                 if (offset >= static_cast<uint64_t>(file_size_)) return false;
                 uint64_t end_req = std::min(offset + length, static_cast<uint64_t>(file_size_));
+
+                // Priorizar agresivamente al inicio de un nuevo rango (seek)
+                if (offset != last_range_start_) {
+                    last_range_start_ = offset;
+                    int start_piece = static_cast<int>((file_offset_ + offset) / piece_size_);
+                    prioritize_seek_range(start_piece);
+                }
 
                 uint64_t current = offset;
 
@@ -350,6 +356,28 @@ namespace cs_stream {
                 std::lock_guard<std::mutex> lock(provider_mutex_);
                 last_piece_idx_ = piece_idx;
                 last_deadline_update_ = now;
+            }
+        }
+
+        void prioritize_seek_range(int piece_idx) {
+            if (!handle_.is_valid()) return;
+            auto ms = now_ms();
+            int first = static_cast<int>(file_offset_ / piece_size_);
+            int last = static_cast<int>((file_offset_ + file_size_ - 1) / piece_size_);
+
+            // Pieza objetivo con prioridad máxima y deadline muy corto
+            handle_.set_piece_deadline(lt::piece_index_t(piece_idx), ms + 500,
+                lt::torrent_handle::alert_when_available);
+            handle_.piece_priority(lt::piece_index_t(piece_idx), lt::download_priority_t{ 7 });
+
+            // Las 2 siguientes piezas con prioridad alta y plazos progresivos
+            for (int i = 1; i <= 2; ++i) {
+                int p = piece_idx + i;
+                if (p <= last) {
+                    handle_.set_piece_deadline(lt::piece_index_t(p), ms + 1000 + i * 500,
+                        lt::torrent_handle::alert_when_available);
+                    handle_.piece_priority(lt::piece_index_t(p), lt::download_priority_t{ 7 });
+                }
             }
         }
 
@@ -443,6 +471,7 @@ namespace cs_stream {
         std::chrono::steady_clock::time_point last_deadline_update_;
         std::mutex provider_mutex_;
         FILE* file_ = nullptr;
+        uint64_t last_range_start_ = 0;   // inicio del último rango solicitado
     };
 
     // ── Funciones de seek ─────────────────────────────────────────────
@@ -478,7 +507,7 @@ namespace cs_stream {
         catch (...) { return false; }
     }
 
-    // ── start_server con precarga configurable ────────────────────────
+    // ── start_server con precarga mínima (primera y última pieza) ─────
     bool start_server(lt::torrent_handle* handle_ptr, int32_t file_index,
         int32_t port, std::string& out_url) {
         try {
@@ -541,43 +570,20 @@ namespace cs_stream {
                     h.set_piece_deadline(lt::piece_index_t(p), now + 5000 + i * 1000,
                         lt::torrent_handle::alert_when_available);
                 }
-            }
 
-            // ═══════════════════════════════════════════════════════
-            //  PRECARGA CONFIGURABLE (porcentaje de caché)
-            // ═══════════════════════════════════════════════════════
-            if (PRELOAD_PERCENT > 0 && psize > 0 && fsize > 0) {
-                int64_t target_bytes = std::min<int64_t>(PRELOAD_BYTES, fsize);
+                // ═══════════════════════════════════════════════════════
+                //  PRECARGA MÍNIMA: espera solo la primera y última pieza
+                // ═══════════════════════════════════════════════════════
                 auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(PRECARGA_TIMEOUT_SEC);
-
-                STREAM_LOG("Precargando %lld bytes antes de iniciar el servidor...", target_bytes);
-
                 auto check_ready = [&]() -> bool {
                     lt::torrent_status st = h.status(lt::torrent_handle::query_pieces);
-                    int first_piece = static_cast<int>(foff / psize);
-                    int last_piece = static_cast<int>((foff + fsize - 1) / psize);
-
-                    // ¿Bytes contiguos al inicio suficientes?
-                    bool inicio_listo = false;
-                    for (int i = first_piece; i <= last_piece; ++i) {
-                        if (i < 0 || i >= (int)st.pieces.size() || !st.pieces[lt::piece_index_t(i)]) {
-                            // primera pieza faltante
-                            inicio_listo = (i * (int64_t)psize - foff) >= target_bytes;
-                            break;
-                        }
-                        // si todas las piezas están completas, inicio_listo = true al final
-                        if (i == last_piece) inicio_listo = true;
-                    }
-
-                    // ¿Última pieza disponible?
-                    bool final_listo = (last_piece >= 0 && last_piece < (int)st.pieces.size() &&
-                        st.pieces[lt::piece_index_t(last_piece)]);
-
-                    return inicio_listo && final_listo;
+                    bool first_ok = (first >= 0 && first < (int)st.pieces.size() && st.pieces[lt::piece_index_t(first)]);
+                    bool last_ok = (last >= 0 && last < (int)st.pieces.size() && st.pieces[lt::piece_index_t(last)]);
+                    return first_ok && last_ok;
                     };
 
-                while (std::chrono::steady_clock::now() < deadline) {
-                    if (check_ready()) break;
+                STREAM_LOG("Esperando que la primera y última pieza estén descargadas...");
+                while (std::chrono::steady_clock::now() < deadline && !check_ready()) {
                     std::this_thread::sleep_for(std::chrono::milliseconds(200));
                 }
             }
@@ -590,8 +596,8 @@ namespace cs_stream {
             g_server->set_payload_max_length(512 * 1024 * 1024);
             g_server->set_keep_alive_max_count(1'000'000);
             g_server->set_keep_alive_timeout(300);
-            g_server->set_read_timeout(60);
-            g_server->set_write_timeout(60);
+            g_server->set_read_timeout(0, 0);     // sin timeout
+            g_server->set_write_timeout(0, 0);    // sin timeout
             g_server->set_tcp_nodelay(true);
 
             auto add_cors = [](httplib::Response& res) {
