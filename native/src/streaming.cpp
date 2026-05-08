@@ -1,8 +1,6 @@
 // streaming.cpp – Servidor de streaming profesional con libtorrent 2.0 y cpp-httplib
 // Versión definitiva para producción: caché RAM prioritaria, readahead en MB,
-// sin deadlocks, bajo polling, robustez total.
-// ✅ AHORA prioriza también el final del archivo (imprescindible para MKV/MP4).
-
+// precarga configurable, sin deadlocks, uso de alert_when_available, robustez total.
 #include "streaming.h"
 #include <libtorrent/torrent_handle.hpp>
 #include <libtorrent/torrent_status.hpp>
@@ -53,14 +51,19 @@
 namespace cs_stream {
 
     // ── Constantes calibradas ──────────────────────────────────────────
-    constexpr int PIECE_DEADLINE_CURRENT_MS = 1500;    // pieza actual (agresivo)
+    constexpr int PIECE_DEADLINE_CURRENT_MS = 1500;    // pieza actual
     constexpr int PIECE_DEADLINE_STEP_MS = 2000;    // incremento por pieza de readahead
     constexpr int PIECE_DEADLINE_MAX_MS = 8000;    // plazo máximo absoluto
-    constexpr int PIECE_POLL_INTERVAL_MS = 50;      // intervalo de sondeo equilibrado
-    constexpr int DEADLINE_UPDATE_INTERVAL_MS = 500;    // refresco de deadlines
-    constexpr int64_t READAHEAD_MB = 16;      // ventana de pre-descarga en MB
-    constexpr size_t CACHE_MAX_MB = 64;      // límite de la caché RAM
+    constexpr int PIECE_POLL_INTERVAL_MS = 50;      // intervalo de sondeo
+    constexpr int DEADLINE_UPDATE_INTERVAL_MS = 500;   // refresco de deadlines
+    constexpr int64_t READAHEAD_MB = 16;      // referencia, el real es porcentaje de caché
+    constexpr size_t CACHE_MAX_MB = 64;
     constexpr size_t CACHE_MAX_BYTES = CACHE_MAX_MB * 1024 * 1024;
+    constexpr int READAHEAD_PERCENT = 25;      // % de la caché para read‑ahead
+    constexpr size_t READAHEAD_BYTES = CACHE_MAX_BYTES * READAHEAD_PERCENT / 100;
+    constexpr int PRELOAD_PERCENT = 5;       // % de caché a precargar antes de iniciar el servidor (0 = sin espera)
+    constexpr size_t PRELOAD_BYTES = CACHE_MAX_BYTES * PRELOAD_PERCENT / 100;
+    constexpr int PRECARGA_TIMEOUT_SEC = 30;      // timeout máximo para la precarga
 
     // ── Estado global ──────────────────────────────────────────────────
     static std::mutex            g_state_mutex;
@@ -224,7 +227,7 @@ namespace cs_stream {
     }
 
     // ═══════════════════════════════════════════════════════════════════
-    // TorrentContentProvider – Caché RAM prioritaria, lógica limpia
+    // TorrentContentProvider – Versión profesional con alert_when_available
     // ═══════════════════════════════════════════════════════════════════
     class TorrentContentProvider {
     public:
@@ -243,8 +246,9 @@ namespace cs_stream {
         {
             if (piece_size_ > 0) {
                 int64_t total_pieces = (file_size_ + piece_size_ - 1) / piece_size_;
-                int pieces_for_16mb = static_cast<int>((READAHEAD_MB * 1024 * 1024) / piece_size_);
-                readahead_pieces_ = std::max(1, std::min(pieces_for_16mb, static_cast<int>(total_pieces)));
+                int64_t ahead_bytes = READAHEAD_BYTES;
+                readahead_pieces_ = std::max<int64_t>(1, ahead_bytes / piece_size_);
+                if (readahead_pieces_ > total_pieces) readahead_pieces_ = static_cast<int>(total_pieces);
             }
             else {
                 readahead_pieces_ = 1;
@@ -280,8 +284,10 @@ namespace cs_stream {
                         }
                     }
 
-                    // 3. Pieza no disponible → renovar deadline y esperar
-                    handle_.set_piece_deadline(lt::piece_index_t(piece_idx), now_ms() + 3000);
+                    // 3. Pieza no disponible → deadline con alert_when_available y espera
+                    handle_.set_piece_deadline(lt::piece_index_t(piece_idx),
+                        now_ms() + 3000,
+                        lt::torrent_handle::alert_when_available);
                     std::this_thread::sleep_for(std::chrono::milliseconds(PIECE_POLL_INTERVAL_MS));
                 }
                 return true;
@@ -318,19 +324,21 @@ namespace cs_stream {
             int last = static_cast<int>((file_offset_ + file_size_ - 1) / piece_size_);
 
             // Pieza actual
-            handle_.set_piece_deadline(lt::piece_index_t(piece_idx), ms + PIECE_DEADLINE_CURRENT_MS);
+            handle_.set_piece_deadline(lt::piece_index_t(piece_idx), ms + PIECE_DEADLINE_CURRENT_MS,
+                lt::torrent_handle::alert_when_available);
 
             // Readahead hacia delante
             int max_ahead = std::min(piece_idx + readahead_pieces_, last);
             for (int p = piece_idx + 1; p <= max_ahead; ++p) {
                 int64_t dl = ms + PIECE_DEADLINE_CURRENT_MS + (p - piece_idx) * PIECE_DEADLINE_STEP_MS;
                 if (dl > ms + PIECE_DEADLINE_MAX_MS) dl = ms + PIECE_DEADLINE_MAX_MS;
-                handle_.set_piece_deadline(lt::piece_index_t(p), dl);
+                handle_.set_piece_deadline(lt::piece_index_t(p), dl, lt::torrent_handle::alert_when_available);
             }
 
             // Un par de piezas hacia atrás (por seek)
             for (int p = std::max(first, piece_idx - 2); p < piece_idx; ++p) {
-                handle_.set_piece_deadline(lt::piece_index_t(p), ms + 4000);
+                handle_.set_piece_deadline(lt::piece_index_t(p), ms + 4000,
+                    lt::torrent_handle::alert_when_available);
             }
 
             // Prioridades altas para la ventana
@@ -373,15 +381,22 @@ namespace cs_stream {
             int64_t piece_length = piece_end - piece_start;
             if (piece_length <= 0) return false;
 
-            auto buffer = std::make_shared<std::vector<char>>(piece_length);
-            if (!seek_file(piece_start)) return false;
-            size_t n = fread(buffer->data(), 1, piece_length, file_);
-            if (n != static_cast<size_t>(piece_length)) {
+            // Reintentos ante fallos de lectura (archivos sparse)
+            for (int attempt = 0; attempt < 3; ++attempt) {
+                auto buffer = std::make_shared<std::vector<char>>(piece_length);
+                if (!seek_file(piece_start)) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                    continue;
+                }
+                size_t n = fread(buffer->data(), 1, piece_length, file_);
+                if (n == static_cast<size_t>(piece_length)) {
+                    cache_put(piece_idx, buffer);
+                    return true;
+                }
                 clearerr(file_);
-                return false;
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
             }
-            cache_put(piece_idx, buffer);
-            return true;
+            return false;
         }
 
         bool open_file_if_needed() {
@@ -407,7 +422,9 @@ namespace cs_stream {
             return file_ != nullptr;
         }
 
-        void close_file() { if (file_) { fclose(file_); file_ = nullptr; } }
+        void close_file() {
+            if (file_) { fclose(file_); file_ = nullptr; }
+        }
 
         bool seek_file(int64_t pos) {
 #ifdef _WIN32
@@ -461,8 +478,9 @@ namespace cs_stream {
         catch (...) { return false; }
     }
 
-    // ── start_server / stop_server ────────────────────────────────────
-    bool start_server(lt::torrent_handle* handle_ptr, int32_t file_index, int32_t port, std::string& out_url) {
+    // ── start_server con precarga configurable ────────────────────────
+    bool start_server(lt::torrent_handle* handle_ptr, int32_t file_index,
+        int32_t port, std::string& out_url) {
         try {
             if (g_running.load(std::memory_order_acquire)) {
                 g_last_error = "Server already running";
@@ -478,7 +496,10 @@ namespace cs_stream {
             auto ti = st.torrent_file.lock();
             if (!ti) { g_last_error = "Torrent has no metadata yet"; return false; }
             const auto& files = ti->files();
-            if (file_index < 0 || file_index >= files.num_files()) { g_last_error = "File index out of range"; return false; }
+            if (file_index < 0 || file_index >= files.num_files()) {
+                g_last_error = "File index out of range";
+                return false;
+            }
 
             lt::file_index_t fidx{ file_index };
             std::filesystem::path save_path(st.save_path);
@@ -497,34 +518,71 @@ namespace cs_stream {
                 g_etag = etag.str(); g_last_error.clear();
             }
 
-            // ═══════════════════════════════════════════════════════
-            //  PRIORIDADES INICIALES: principio Y final del archivo
-            // ═══════════════════════════════════════════════════════
+            // ── Prioridades iniciales ─────────────────────────────────
             if (psize > 0 && fsize > 0) {
                 int first = static_cast<int>(foff / psize);
                 int last = static_cast<int>((foff + fsize - 1) / psize);
                 auto now = std::chrono::duration_cast<std::chrono::milliseconds>(
                     std::chrono::steady_clock::now().time_since_epoch()).count();
 
-                // ── PRINCIPIO: readahead de 16 MB ─────────────────
-                int pahead = std::max(1, std::min(static_cast<int>((READAHEAD_MB * 1024 * 1024) / psize), last - first + 1));
-                for (int p = first; p <= first + pahead; ++p) {
+                // Principio: read‑ahead dinámico
+                int ahead_pieces = std::max(1, static_cast<int>(READAHEAD_BYTES / psize));
+                int max_ahead = std::min(first + ahead_pieces - 1, last);
+                for (int p = first; p <= max_ahead; ++p) {
                     h.piece_priority(lt::piece_index_t(p), lt::download_priority_t{ 7 });
-                    h.set_piece_deadline(lt::piece_index_t(p), now + PIECE_DEADLINE_CURRENT_MS + (p - first) * 2000);
+                    h.set_piece_deadline(lt::piece_index_t(p), now + PIECE_DEADLINE_CURRENT_MS + (p - first) * PIECE_DEADLINE_STEP_MS,
+                        lt::torrent_handle::alert_when_available);
                 }
 
-                // ── FINAL: últimas piezas (imprescindible para MKV/MP4) ─
-                constexpr int tailCount = 3;  // priorizar las 3 últimas piezas
-                for (int i = 0; i < tailCount; ++i) {
+                // Final: últimas 3 piezas (metadatos)
+                for (int i = 0; i < 3 && (last - i) >= first; ++i) {
                     int p = last - i;
-                    if (p >= first) {
-                        h.piece_priority(lt::piece_index_t(p), lt::download_priority_t{ 7 });
-                        h.set_piece_deadline(lt::piece_index_t(p), now + 5000 + i * 1000);
-                    }
+                    h.piece_priority(lt::piece_index_t(p), lt::download_priority_t{ 7 });
+                    h.set_piece_deadline(lt::piece_index_t(p), now + 5000 + i * 1000,
+                        lt::torrent_handle::alert_when_available);
                 }
             }
 
-            // Configurar servidor HTTP
+            // ═══════════════════════════════════════════════════════
+            //  PRECARGA CONFIGURABLE (porcentaje de caché)
+            // ═══════════════════════════════════════════════════════
+            if (PRELOAD_PERCENT > 0 && psize > 0 && fsize > 0) {
+                int64_t target_bytes = std::min<int64_t>(PRELOAD_BYTES, fsize);
+                auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(PRECARGA_TIMEOUT_SEC);
+
+                STREAM_LOG("Precargando %lld bytes antes de iniciar el servidor...", target_bytes);
+
+                auto check_ready = [&]() -> bool {
+                    lt::torrent_status st = h.status(lt::torrent_handle::query_pieces);
+                    int first_piece = static_cast<int>(foff / psize);
+                    int last_piece = static_cast<int>((foff + fsize - 1) / psize);
+
+                    // ¿Bytes contiguos al inicio suficientes?
+                    bool inicio_listo = false;
+                    for (int i = first_piece; i <= last_piece; ++i) {
+                        if (i < 0 || i >= (int)st.pieces.size() || !st.pieces[lt::piece_index_t(i)]) {
+                            // primera pieza faltante
+                            inicio_listo = (i * (int64_t)psize - foff) >= target_bytes;
+                            break;
+                        }
+                        // si todas las piezas están completas, inicio_listo = true al final
+                        if (i == last_piece) inicio_listo = true;
+                    }
+
+                    // ¿Última pieza disponible?
+                    bool final_listo = (last_piece >= 0 && last_piece < (int)st.pieces.size() &&
+                        st.pieces[lt::piece_index_t(last_piece)]);
+
+                    return inicio_listo && final_listo;
+                    };
+
+                while (std::chrono::steady_clock::now() < deadline) {
+                    if (check_ready()) break;
+                    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+                }
+            }
+
+            // ── Configurar servidor HTTP ─────────────────────────────
             g_server = std::make_unique<httplib::Server>();
             g_server->set_exception_handler([](const httplib::Request&, httplib::Response& res, std::exception_ptr) {
                 res.status = 500; res.set_content("Internal Server Error", "text/plain");
