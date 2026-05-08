@@ -1,6 +1,7 @@
 // streaming.cpp – Servidor de streaming profesional con libtorrent 2.0 y cpp-httplib
 // Versión definitiva para producción: caché RAM prioritaria, readahead en MB,
 // sin deadlocks, bajo polling, robustez total.
+// ✅ AHORA prioriza también el final del archivo (imprescindible para MKV/MP4).
 
 #include "streaming.h"
 #include <libtorrent/torrent_handle.hpp>
@@ -406,9 +407,7 @@ namespace cs_stream {
             return file_ != nullptr;
         }
 
-        void close_file() {
-            if (file_) { fclose(file_); file_ = nullptr; }
-        }
+        void close_file() { if (file_) { fclose(file_); file_ = nullptr; } }
 
         bool seek_file(int64_t pos) {
 #ifdef _WIN32
@@ -498,16 +497,30 @@ namespace cs_stream {
                 g_etag = etag.str(); g_last_error.clear();
             }
 
-            // Prioridades iniciales
+            // ═══════════════════════════════════════════════════════
+            //  PRIORIDADES INICIALES: principio Y final del archivo
+            // ═══════════════════════════════════════════════════════
             if (psize > 0 && fsize > 0) {
                 int first = static_cast<int>(foff / psize);
                 int last = static_cast<int>((foff + fsize - 1) / psize);
-                int pahead = std::max(1, std::min(static_cast<int>((READAHEAD_MB * 1024 * 1024) / psize), last - first + 1));
                 auto now = std::chrono::duration_cast<std::chrono::milliseconds>(
                     std::chrono::steady_clock::now().time_since_epoch()).count();
+
+                // ── PRINCIPIO: readahead de 16 MB ─────────────────
+                int pahead = std::max(1, std::min(static_cast<int>((READAHEAD_MB * 1024 * 1024) / psize), last - first + 1));
                 for (int p = first; p <= first + pahead; ++p) {
                     h.piece_priority(lt::piece_index_t(p), lt::download_priority_t{ 7 });
                     h.set_piece_deadline(lt::piece_index_t(p), now + PIECE_DEADLINE_CURRENT_MS + (p - first) * 2000);
+                }
+
+                // ── FINAL: últimas piezas (imprescindible para MKV/MP4) ─
+                constexpr int tailCount = 3;  // priorizar las 3 últimas piezas
+                for (int i = 0; i < tailCount; ++i) {
+                    int p = last - i;
+                    if (p >= first) {
+                        h.piece_priority(lt::piece_index_t(p), lt::download_priority_t{ 7 });
+                        h.set_piece_deadline(lt::piece_index_t(p), now + 5000 + i * 1000);
+                    }
                 }
             }
 

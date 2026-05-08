@@ -33,7 +33,7 @@
         <PackageProjectUrl>https://github.com/aspriddell/csdl</PackageProjectUrl>
 
         <!-- Versión mejorada por NidroySoft -->
-		<Version>2.1.0</Version>
+		<Version>2.1.1</Version>
     </PropertyGroup>
 
     <ItemGroup>
