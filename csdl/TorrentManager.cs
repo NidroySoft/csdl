@@ -120,7 +120,7 @@ public class TorrentManager
     /// Thrown if the native server fails to start (torrent has no metadata yet,
     /// invalid file index, or port already in use).
     /// </exception>
-    public string StartStreaming(int fileIndex, int port = 0)
+    public string StartStreaming(int fileIndex, int port = 55126)
     {
         ObjectDisposedException.ThrowIf(_detached, this);
 
