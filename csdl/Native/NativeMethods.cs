@@ -270,8 +270,8 @@ internal static partial class NativeMethods
     /// or <see cref="IntPtr.Zero"/> on failure. The string is owned by the native library —
     /// do not free it. Valid until <see cref="StopStreamServer"/> is called.
     /// </returns>
-    [LibraryImport(LibraryName, EntryPoint = "start_stream_server")]
-    public static partial IntPtr StartStreamServer(IntPtr torrentSessionHandle, int fileIndex, int port);
+    [DllImport(LibraryName, EntryPoint = "start_stream_server", CallingConvention = CallingConvention.Cdecl)]
+    public static extern IntPtr StartStreamServer(IntPtr sessionHandle, IntPtr torrentSessionHandle, int fileIndex, int port);
 
     /// <summary>
     /// Stops the embedded streaming server and releases its resources.

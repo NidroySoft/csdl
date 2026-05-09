@@ -170,7 +170,7 @@ public class TorrentClient : IDisposable
             throw new InvalidOperationException("Failed to attach torrent to session.");
         }
 
-        var manager = new TorrentManager(handle, savePath, torrent);
+        var manager = new TorrentManager(_handle, handle, savePath, torrent);
         _attachedManagers.TryAdd(manager.Info.Metadata.InfoHash, manager);
 
         return manager;

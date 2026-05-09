@@ -21,12 +21,14 @@ public class TorrentManager
 
 
 
-    internal TorrentManager(IntPtr torrentSessionHandle, string savePath, TorrentInfo info)
+    internal TorrentManager(IntPtr sessionHandle, IntPtr torrentSessionHandle, string savePath, TorrentInfo info)
     {
-        Info = info;
+        _sessionHandle = sessionHandle;
         TorrentSessionHandle = torrentSessionHandle;
         _savePath = savePath;
+        Info = info;
     }
+    private readonly IntPtr _sessionHandle;
     private int? _pieceSize;
 
     /// <summary>
@@ -128,13 +130,13 @@ public class TorrentManager
         if (NativeMethods.IsStreamServerRunning())
             NativeMethods.StopStreamServer();
 
-        IntPtr urlPtr = NativeMethods.StartStreamServer(TorrentSessionHandle, fileIndex, port);
+        IntPtr urlPtr = NativeMethods.StartStreamServer(_sessionHandle, TorrentSessionHandle, fileIndex, port);
 
         // Si falló por estado corrupto, hacemos reset completo y reintentamos una sola vez
         if (urlPtr == IntPtr.Zero)
         {
             NativeMethods.ResetStreamServer();           // Limpieza profunda
-            urlPtr = NativeMethods.StartStreamServer(TorrentSessionHandle, fileIndex, port);
+            urlPtr = NativeMethods.StartStreamServer(_sessionHandle, TorrentSessionHandle, fileIndex, port);
         }
 
         if (urlPtr == IntPtr.Zero)
