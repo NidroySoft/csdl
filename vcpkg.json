@@ -1,6 +1,6 @@
 {
   "name": "csdl-native",
-  "version-string": "2.2.1",
+  "version-string": "2.3.0",
   "builtin-baseline": "bc3512a509f9d29b37346a7e7e929f9a26e66c7e",
   "dependencies": [
     {

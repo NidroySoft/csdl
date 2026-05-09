@@ -112,13 +112,14 @@ int main(int argc, char* argv[])
 
         // ── Iniciar servidor streaming ─────────────────────────────────
         std::string url;
-        if (!cs_stream::start_server(&handle, videoIdx, port, url)) {
+        if (!cs_stream::start_server(&ses, &handle, videoIdx, port, url)) {
             std::cerr << "Error: " << cs_stream::last_error() << std::endl;
             running = false;
             alert_thread.join();
             std::cin.get();
             return 1;
         }
+
         std::cout << ">>> SERVIDOR LISTO <<<\n"
             << "URL: " << url << "\n"
             << "Status: http://127.0.0.1:" << port << "/status\n";

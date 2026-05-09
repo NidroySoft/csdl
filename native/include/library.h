@@ -56,7 +56,7 @@ extern "C" {
     // Starts an embedded HTTP server for the given file within the torrent.
     // Returns the base URL (e.g. "http://127.0.0.1:55126/") or nullptr on failure.
     // Call stop_stream_server() before attaching a new torrent.
-    CSDL_EXPORT const char* start_stream_server(lt::torrent_handle* torrent, int32_t file_index, int32_t port);
+    CSDL_EXPORT const char* start_stream_server(lt::session* session, lt::torrent_handle* torrent, int32_t file_index, int32_t port);
     CSDL_EXPORT void        stop_stream_server();
     CSDL_EXPORT uint8_t     is_stream_server_running();
     CSDL_EXPORT void reset_stream_server();

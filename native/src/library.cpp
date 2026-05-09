@@ -7,7 +7,7 @@
 
 // ── Prototipos de funciones implementadas en streaming.cpp ──
 extern "C" {
-    const char* start_stream_server_impl(lt::torrent_handle* torrent, int32_t file_index, int32_t port);
+    const char* start_stream_server_impl(lt::session* session, lt::torrent_handle* torrent, int32_t file_index, int32_t port);
     void        stop_stream_server_impl();
     uint8_t     is_stream_server_running_impl();
     void        reset_stream_server_impl();
@@ -80,7 +80,6 @@ extern "C" {
         if (!session || !torrent) return;
         torrent->pause();
         session->remove_torrent(*torrent);
-        // 'delete torrent' se omite; el handle se libera con la alerta correspondiente
     }
 
     // ── metadatos y ficheros ───────────────────────────────────────────
@@ -188,8 +187,8 @@ extern "C" {
     }
 
     // ── API de streaming y seek (implementaciones en streaming.cpp) ───
-    const char* start_stream_server(lt::torrent_handle* torrent, int32_t file_index, int32_t port) {
-        return start_stream_server_impl(torrent, file_index, port);
+    const char* start_stream_server(lt::session* session, lt::torrent_handle* torrent, int32_t file_index, int32_t port) {
+        return start_stream_server_impl(session, torrent, file_index, port);
     }
     void stop_stream_server() { stop_stream_server_impl(); }
     uint8_t is_stream_server_running() { return is_stream_server_running_impl(); }

@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.21)
 include(GenerateExportHeader)
 
-project(cs_native LANGUAGES CXX VERSION 2.2.1)
+project(cs_native LANGUAGES CXX VERSION 2.3.0)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
