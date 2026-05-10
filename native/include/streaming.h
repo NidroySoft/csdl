@@ -23,8 +23,28 @@ extern "C" {
     void        stop_stream_server_impl();
     uint8_t     is_stream_server_running_impl();
     void        reset_stream_server_impl();
+    const char* get_last_stream_error_impl();
+
+    // Streaming configuration (applied before start_stream_server)
+    void configure_streaming_impl(
+        int cache_limit_mb,
+        int min_readahead, int max_readahead,
+        int back_window,
+        int deadline_base_ms, int deadline_step_ms,
+        int window_update_throttle_ms,
+        int piece_poll_interval_ms,
+        int piece_poll_max_attempts,
+        int anchor_piece_poll_max_attempts,
+        int ensure_piece_max_retries,
+        int deadline_reemit_interval_ms,
+        int startup_buffer_pieces,
+        int tail_pieces,
+        uint8_t enable_tail_prefetch   // 0 = false, non‑zero = true
+    );
 
     uint8_t is_byte_available_impl(lt::torrent_handle* torrent, int32_t file_index, int64_t byte_position);
     uint8_t prioritize_seek_range_impl(lt::torrent_handle* torrent, int32_t file_index, int64_t byte_position, int64_t piece_size);
+
+    void notify_piece_ready_impl(int32_t piece_idx);
 }
 #endif

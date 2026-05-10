@@ -1,78 +1,46 @@
-// test_streaming.cpp – Prueba de streaming con inicio automático de VLC cuando hay buffer
-#define CSDL_STATIC
+// test_streaming.cpp – Abre VLC en cuanto la primera pieza está en RAM
 #include "streaming.h"
-#include "settings.h"          // Para create_streaming_settings()
+#include "settings.h"
 #include <libtorrent/session.hpp>
 #include <libtorrent/torrent_info.hpp>
 #include <libtorrent/torrent_handle.hpp>
 #include <libtorrent/add_torrent_params.hpp>
-#include <libtorrent/file_storage.hpp>
-#include <libtorrent/alert_types.hpp>
-#include <libtorrent/torrent_status.hpp>
 #include <iostream>
-#include <string>
 #include <atomic>
 #include <thread>
 #include <chrono>
 #include <filesystem>
-#include <exception>
-#include <iomanip>
-#include <cstdlib>
+#include <vector>
 
-#ifdef _WIN32
-#include <windows.h>
-#include <shellapi.h>
-#endif
-
-// Abre la URL en VLC (multiplataforma)
 static void open_in_vlc(const std::string& url) {
     std::cout << "\n[VLC] Abriendo " << url << " ...\n";
 #ifdef _WIN32
-    std::string cmd = "start vlc " + url;
+    std::string cmd = "start \"\" \"C:\\Program Files\\VideoLAN\\VLC\\vlc.exe\" " + url + " --network-caching=5000 --http-reconnect";
     system(cmd.c_str());
 #else
-    std::string cmd = "vlc " + url + " &";
-    system(cmd.c_str());
+    system(("vlc " + url + " --network-caching=5000 &").c_str());
 #endif
 }
 
-int main(int argc, char* argv[])
-{
+int main(int argc, char* argv[]) {
     if (argc < 2) {
-        std::cerr << "Uso: test_streaming <archivo.torrent> [puerto] [directorio_descarga]\n";
-        std::cin.get();
+        std::cerr << "Uso: test_streaming <archivo.torrent> [puerto]\n";
         return 1;
     }
 
     std::string torrentFile = argv[1];
     int port = (argc >= 3) ? std::stoi(argv[2]) : 55201;
-    std::string downloadDir = (argc >= 4) ? argv[3] : "./downloads";
+    std::string downloadDir = "./downloads";
 
     try {
-        // ── Preparar directorio de descarga ────────────────────────────
         std::error_code ec;
         std::filesystem::remove_all(downloadDir, ec);
         std::filesystem::create_directories(downloadDir, ec);
-        std::cout << "Descargas: " << downloadDir << " (limpio)\n";
+        std::cout << "Directorio de descarga limpio.\n";
 
-        // ── Configuración de sesión ────────────────────────────────────
-        lt::settings_pack pack = *create_streaming_settings();
-        pack.set_int(lt::settings_pack::alert_mask,
-            lt::alert_category::error | lt::alert_category::status);
-        lt::session ses(pack);
+        lt::session ses(*create_streaming_settings());
+        auto ti = std::make_shared<lt::torrent_info>(torrentFile);
 
-        // ── Cargar torrent ─────────────────────────────────────────────
-        std::shared_ptr<lt::torrent_info> ti;
-        try {
-            ti = std::make_shared<lt::torrent_info>(torrentFile);
-        }
-        catch (lt::system_error const& e) {
-            std::cerr << "Error al cargar torrent: " << e.what() << std::endl;
-            std::cin.get();
-            return 1;
-        }
-
-        // ── Seleccionar el archivo más grande ──────────────────────────
         int videoIdx = 0;
         std::int64_t maxSize = 0;
         for (int i = 0; i < ti->num_files(); ++i) {
@@ -82,101 +50,47 @@ int main(int argc, char* argv[])
                 videoIdx = i;
             }
         }
-        std::string fileName = std::string(ti->files().file_name(lt::file_index_t{ videoIdx }));
-        std::cout << "Archivo: " << fileName << " (" << maxSize / 1024 / 1024 << " MiB)\n";
 
-        // ── Añadir torrent ─────────────────────────────────────────────
+        std::cout << "Archivo: " << ti->files().file_name(lt::file_index_t{ videoIdx })
+            << " (" << maxSize / (1024 * 1024) << " MiB)\n";
+
         lt::add_torrent_params params;
         params.ti = ti;
         params.save_path = downloadDir;
         params.storage_mode = lt::storage_mode_sparse;
-        params.flags &= ~lt::torrent_flags::auto_managed;
-        lt::torrent_handle handle = ses.add_torrent(params);
+
+        auto handle = ses.add_torrent(params);
         handle.resume();
 
-        // ── Hilo de alertas (solo errores y finalización) ──────────────
-        std::atomic<bool> running = true;
-        std::thread alert_thread([&]() {
-            while (running) {
-                std::vector<lt::alert*> alerts;
-                ses.pop_alerts(&alerts);
-                for (auto* a : alerts) {
-                    if (a->category() & lt::alert_category::error)
-                        std::cerr << "[ERROR] " << a->message() << std::endl;
-                    if (lt::alert_cast<lt::torrent_finished_alert>(a))
-                        std::cout << "\n[COMPLETADO] Descarga finalizada.\n";
-                }
-                std::this_thread::sleep_for(std::chrono::milliseconds(200));
-            }
-            });
-
-        // ── Iniciar servidor streaming ─────────────────────────────────
         std::string url;
         if (!cs_stream::start_server(&ses, &handle, videoIdx, port, url)) {
-            std::cerr << "Error: " << cs_stream::last_error() << std::endl;
-            running = false;
-            alert_thread.join();
-            std::cin.get();
+            std::cerr << "Error iniciando servidor: " << cs_stream::last_error() << std::endl;
             return 1;
         }
 
-        std::cout << ">>> SERVIDOR LISTO <<<\n"
-            << "URL: " << url << "\n"
-            << "Status: http://127.0.0.1:" << port << "/status\n";
+        std::cout << ">>> SERVIDOR LISTO <<<\nURL: " << url << "\n";
 
-        // ── Esperar buffer inicial antes de abrir VLC ──────────────────
-        constexpr std::int64_t MIN_BUFFER_BYTES = 5 * 1024 * 1024;  // 5 MiB
-        constexpr double MIN_BUFFER_PCT = 2.0;                       // 2%
-
-        std::cout << "Esperando buffer inicial (" << MIN_BUFFER_BYTES / 1024 / 1024 << " MiB o "
-            << MIN_BUFFER_PCT << "%) para abrir VLC...\n";
-
+        // ── Abrir VLC en cuanto la primera pieza esté en RAM ──────────
+        std::cout << "Esperando buffer inicial (primera pieza)...\n";
         bool vlc_opened = false;
-        std::thread vlc_thread([&]() {
-            while (running && !vlc_opened) {
-                std::vector<std::int64_t> fprog;
-                handle.file_progress(fprog);
-                std::int64_t downloaded = (videoIdx < (int)fprog.size()) ? fprog[videoIdx] : 0;
-                double pct = (maxSize > 0) ? 100.0 * downloaded / maxSize : 0.0;
-                if (downloaded >= MIN_BUFFER_BYTES || pct >= MIN_BUFFER_PCT) {
-                    open_in_vlc(url);
-                    vlc_opened = true;
-                    break;
-                }
-                std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        while (!vlc_opened) {
+            // La primera pieza ya está en RAM gracias a la precarga de start_server
+            if (cs_stream::is_byte_available(&handle, videoIdx, 0)) {
+                open_in_vlc(url);
+                vlc_opened = true;
+                break;
             }
-            });
-        vlc_thread.detach(); // no necesitamos esperarlo
-
-        // ── Hilo de progreso ───────────────────────────────────────────
-        std::thread progress_thread([&]() {
-            while (running) {
-                std::vector<std::int64_t> fprog;
-                handle.file_progress(fprog);
-                std::int64_t dl = (videoIdx < (int)fprog.size()) ? fprog[videoIdx] : 0;
-                double pct = (maxSize > 0) ? 100.0 * dl / maxSize : 0.0;
-                std::cout << "\rProgreso: " << std::fixed << std::setprecision(1)
-                    << pct << "% (" << dl / 1024 / 1024 << " MiB)  " << std::flush;
-                std::this_thread::sleep_for(std::chrono::seconds(2));
-            }
-            std::cout << std::endl;
-            });
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
 
         std::cout << "\nPresiona ENTER para detener...\n";
         std::cin.get();
 
-        running = false;
-        progress_thread.join();
-        alert_thread.join();
-
         cs_stream::stop_server();
         std::cout << "Servidor detenido.\n";
-        ses.pause();
-        std::cout << "Sesión pausada.\n";
     }
     catch (const std::exception& e) {
         std::cerr << "Excepción: " << e.what() << std::endl;
-        std::cin.get();
         return 1;
     }
 

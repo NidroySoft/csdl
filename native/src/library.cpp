@@ -1,18 +1,9 @@
-// library.cpp - Versión final compatible con libtorrent 2.0.11 y el ejecutable de test
 #include "library.h"
 #include "streaming.h"
+#include "settings.h"
 #include <libtorrent/torrent_handle.hpp>
 #include <algorithm>
 #include <cstring>
-
-// ── Prototipos de funciones implementadas en streaming.cpp ──
-extern "C" {
-    const char* start_stream_server_impl(lt::session* session, lt::torrent_handle* torrent, int32_t file_index, int32_t port);
-    void        stop_stream_server_impl();
-    uint8_t     is_stream_server_running_impl();
-    void        reset_stream_server_impl();
-    const char* get_last_stream_error_impl();
-}
 
 extern "C" {
 
@@ -34,7 +25,7 @@ extern "C" {
         session->apply_settings(*settings);
     }
 
-    // ── eventos (delegan en events.cpp, ahora por sesión) ─────────────
+    // ── eventos ────────────────────────────────────────────────────────
     void clear_event_callback(lt::session* session) {
         if (!session) return;
         cs_destroy_event_handler_for_session(session);
@@ -49,7 +40,7 @@ extern "C" {
         cs_create_event_handler(session, callback, include_unmapped_events);
     }
 
-    // ── torrent info ───────────────────────────────────────────────────
+    // ── torrent info ────────────────────────────────────────────────────
     lt::torrent_info* create_torrent_bytes(const char* data, long length) {
         const lt::span buffer(data, length);
         lt::load_torrent_limits cfg;
@@ -62,7 +53,7 @@ extern "C" {
 
     void destroy_torrent(lt::torrent_info* torrent) { delete torrent; }
 
-    // ── attach / detach ────────────────────────────────────────────────
+    // ── attach / detach ─────────────────────────────────────────────────
     lt::torrent_handle* attach_torrent(lt::session* session, lt::torrent_info* torrent, const char* save_path) {
         if (!session || !torrent) return nullptr;
         lt::add_torrent_params params;
@@ -82,7 +73,7 @@ extern "C" {
         session->remove_torrent(*torrent);
     }
 
-    // ── metadatos y ficheros ───────────────────────────────────────────
+    // ── metadatos y ficheros ────────────────────────────────────────────
     torrent_metadata* get_torrent_info(lt::torrent_info* torrent) {
         if (!torrent) return nullptr;
         auto* info = new torrent_metadata();
@@ -141,7 +132,7 @@ extern "C" {
         delete[] file_list->files;
     }
 
-    // ── prioridades y control ──────────────────────────────────────────
+    // ── prioridades y control ───────────────────────────────────────────
     void set_file_dl_priority(lt::torrent_handle* torrent, int32_t file_index, uint8_t priority) {
         if (!torrent) return;
         torrent->file_priority(lt::file_index_t(file_index), lt::download_priority_t(priority));
@@ -168,13 +159,13 @@ extern "C" {
         if (s.errc) ts->state = cs_torrent_state::torrent_error;
         else {
             switch (s.state) {
-            case lt::torrent_status::checking_files: ts->state = cs_torrent_state::torrent_checking; break;
-            case lt::torrent_status::checking_resume_data: ts->state = cs_torrent_state::torrent_checking_resume; break;
-            case lt::torrent_status::downloading_metadata: ts->state = cs_torrent_state::torrent_metadata_downloading; break;
-            case lt::torrent_status::downloading: ts->state = cs_torrent_state::torrent_downloading; break;
-            case lt::torrent_status::seeding: ts->state = cs_torrent_state::torrent_seeding; break;
-            case lt::torrent_status::finished: ts->state = cs_torrent_state::torrent_finished; break;
-            default: ts->state = cs_torrent_state::torrent_state_unknown; break;
+            case lt::torrent_status::checking_files:        ts->state = cs_torrent_state::torrent_checking; break;
+            case lt::torrent_status::checking_resume_data:  ts->state = cs_torrent_state::torrent_checking_resume; break;
+            case lt::torrent_status::downloading_metadata:  ts->state = cs_torrent_state::torrent_metadata_downloading; break;
+            case lt::torrent_status::downloading:           ts->state = cs_torrent_state::torrent_downloading; break;
+            case lt::torrent_status::seeding:               ts->state = cs_torrent_state::torrent_seeding; break;
+            case lt::torrent_status::finished:              ts->state = cs_torrent_state::torrent_finished; break;
+            default:                                        ts->state = cs_torrent_state::torrent_state_unknown; break;
             }
         }
         ts->progress = s.progress;
@@ -186,7 +177,7 @@ extern "C" {
         ts->download_rate = s.download_payload_rate;
     }
 
-    // ── API de streaming y seek (implementaciones en streaming.cpp) ───
+    // ── API de streaming ────────────────────────────────────────────────
     const char* start_stream_server(lt::session* session, lt::torrent_handle* torrent, int32_t file_index, int32_t port) {
         return start_stream_server_impl(session, torrent, file_index, port);
     }
@@ -219,4 +210,37 @@ extern "C" {
         return cs_stream::prioritize_seek_range(torrent, file_index, byte_position, piece_size) ? 1 : 0;
     }
 #endif
-}
+
+    // ── configuración de streaming ──────────────────────────────────────
+    void configure_stream_server(
+        int cache_limit_mb,
+        int min_readahead, int max_readahead,
+        int back_window,
+        int deadline_base_ms, int deadline_step_ms,
+        int window_update_throttle_ms,
+        int piece_poll_interval_ms,
+        int piece_poll_max_attempts,
+        int anchor_piece_poll_max_attempts,
+        int ensure_piece_max_retries,
+        int deadline_reemit_interval_ms,
+        int startup_buffer_pieces,
+        int tail_pieces,
+        uint8_t enable_tail_prefetch
+    ) {
+        configure_streaming_impl(
+            cache_limit_mb,
+            min_readahead, max_readahead,
+            back_window,
+            deadline_base_ms, deadline_step_ms,
+            window_update_throttle_ms,
+            piece_poll_interval_ms,
+            piece_poll_max_attempts,
+            anchor_piece_poll_max_attempts,
+            ensure_piece_max_retries,
+            deadline_reemit_interval_ms,
+            startup_buffer_pieces,
+            tail_pieces,
+            enable_tail_prefetch
+        );
+    }
+} // extern "C"

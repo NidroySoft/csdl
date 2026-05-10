@@ -306,5 +306,19 @@ public class TorrentClient : IDisposable
 
         // the native library always invokes this from another thread
         AlertRaised?.Invoke(this, forwardAlert);
+
+
+    }
+  
+    /// <summary>
+    /// Applies streaming configuration to the session.
+    /// Must be called before <see cref="TorrentManager.StartStreaming"/>.
+    /// </summary>
+    /// <param name="config">The streaming configuration to apply. If <c>null</c>, defaults are used.</param>
+    public void ConfigureStreaming(StreamingConfiguration config)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        config ??= new StreamingConfiguration(); // safe defaults
+        config.Apply();
     }
 }

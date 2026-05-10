@@ -1,8 +1,10 @@
-// streaming.cpp – Servidor de streaming profesional con libtorrent 2.0 y cpp-httplib
-// Versión final: ventana móvil estricta, prioridad 0 fuera, precarga mínima, readahead dinámico,
-//                timeouts desactivados, caché LRU en RAM, configuración de streaming aplicada.
+// streaming.cpp – RAM-first streaming server using libtorrent 2.0 and cpp-httplib
+//
+// Multiplatform: Windows, Linux, macOS
+// Requires CMake to link pthread (Linux) and ws2_32 (Windows).
 
 #include "streaming.h"
+
 #include <libtorrent/torrent_handle.hpp>
 #include <libtorrent/torrent_status.hpp>
 #include <libtorrent/torrent_info.hpp>
@@ -14,6 +16,8 @@
 #include <atomic>
 #include <thread>
 #include <mutex>
+#include <shared_mutex>
+#include <condition_variable>
 #include <chrono>
 #include <sstream>
 #include <cstring>
@@ -25,24 +29,22 @@
 #include <filesystem>
 #include <unordered_map>
 #include <list>
+#include <set>
+#include <functional>
 #include "lib_export.h"
+
+// httplib requires these defines on Windows before inclusion
+#ifdef _WIN32
+#  ifndef _WIN32_WINNT
+#    define _WIN32_WINNT 0x0A00   // Windows 10+
+#  endif
+#  ifndef WIN32_LEAN_AND_MEAN
+#    define WIN32_LEAN_AND_MEAN
+#  endif
+#endif
 
 #define CPPHTTPLIB_OPENSSL_SUPPORT 0
 #include <httplib.h>
-
-#ifdef _WIN32
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
-#include <windows.h>
-#include <winsock2.h>
-#include <ws2tcpip.h>
-#include <share.h>
-#pragma comment(lib, "ws2_32.lib")
-#else
-#include <unistd.h>
-#include <sys/stat.h>
-#endif
 
 #ifdef _DEBUG
 #  define STREAM_LOG(fmt, ...) fprintf(stderr, "[CSDL-STREAM] " fmt "\n", ##__VA_ARGS__)
@@ -52,627 +54,1022 @@
 
 namespace cs_stream {
 
-    // ── Constantes ──────────────────────────────────────────────────
-    constexpr int PIECE_DEADLINE_CURRENT_MS = 1500;
-    constexpr int PIECE_DEADLINE_STEP_MS = 2000;
-    constexpr int PIECE_DEADLINE_MAX_MS = 8000;
-    constexpr int PIECE_POLL_INTERVAL_MS = 50;
-    constexpr int DEADLINE_UPDATE_INTERVAL_MS = 500;
-    constexpr size_t CACHE_MAX_MB = 64;
-    constexpr size_t CACHE_MAX_BYTES = CACHE_MAX_MB * 1024 * 1024;
-    constexpr int READAHEAD_PERCENT = 25;
-    constexpr size_t READAHEAD_BYTES = CACHE_MAX_BYTES * READAHEAD_PERCENT / 100;
-    constexpr int PRECARGA_TIMEOUT_SEC = 30;
+    // ════════════════════════════════════════════════════════════════════════
+    // Default constants (used when configuration is not provided)
+    // ════════════════════════════════════════════════════════════════════════
+    constexpr int DEFAULT_CACHE_LIMIT_MB = 512;
+    constexpr int DEFAULT_MIN_AHEAD = 24;
+    constexpr int DEFAULT_MAX_AHEAD = 192;
+    constexpr int DEFAULT_BACK_WINDOW = 6;
+    constexpr int DEFAULT_DEADLINE_BASE_MS = 1200;
+    constexpr int DEFAULT_DEADLINE_STEP_MS = 800;
+    constexpr int DEFAULT_READ_TIMEOUT_MS = 15000;
+    constexpr int DEFAULT_ALERT_PUMP_INTERVAL_MS = 15;
+    constexpr int DEFAULT_WINDOW_UPDATE_THROTTLE_MS = 250;
+    constexpr int64_t DEFAULT_READAHEAD_BYTES = 32LL * 1024 * 1024;
+    constexpr int DEFAULT_TAIL_PIECES = 3;
+    constexpr int DEFAULT_PIECE_POLL_INTERVAL_MS = 50;
+    constexpr int DEFAULT_PIECE_POLL_MAX_ATTEMPTS = 300;
+    constexpr int DEFAULT_ANCHOR_PIECE_POLL_MAX_ATTEMPTS = 1200;
+    constexpr int DEFAULT_ENSURE_PIECE_MAX_RETRIES = 3;
+    constexpr int DEFAULT_DEADLINE_REEMIT_INTERVAL_MS = 2000;
+    constexpr int DEFAULT_STARTUP_BUFFER_PIECES = 12;
+    constexpr bool DEFAULT_ENABLE_TAIL_PREFETCH = true;
 
-    // ── Estado global ───────────────────────────────────────────────
-    static std::mutex            g_state_mutex;
-    static lt::torrent_handle   g_handle;
-    static int                   g_file_index = -1;
-    static std::string           g_file_path;
-    static std::int64_t          g_file_size = 0;
-    static std::int64_t          g_file_offset = 0;
-    static int                   g_piece_size = 0;
-    static std::string           g_mime_type;
-    static std::string           g_etag;
-    static std::string           g_last_error;
-    static std::atomic<bool>     g_running{ false };
+    // ════════════════════════════════════════════════════════════════════════
+    // Runtime configuration (set before start_server, thread-safe read)
+    // ════════════════════════════════════════════════════════════════════════
+    struct StreamingConfig {
+        int cache_limit_mb = DEFAULT_CACHE_LIMIT_MB;
+        int min_readahead = DEFAULT_MIN_AHEAD;
+        int max_readahead = DEFAULT_MAX_AHEAD;
+        int back_window = DEFAULT_BACK_WINDOW;
+        int deadline_base_ms = DEFAULT_DEADLINE_BASE_MS;
+        int deadline_step_ms = DEFAULT_DEADLINE_STEP_MS;
+        int window_update_throttle_ms = DEFAULT_WINDOW_UPDATE_THROTTLE_MS;
+        int piece_poll_interval_ms = DEFAULT_PIECE_POLL_INTERVAL_MS;
+        int piece_poll_max_attempts = DEFAULT_PIECE_POLL_MAX_ATTEMPTS;
+        int anchor_piece_poll_max_attempts = DEFAULT_ANCHOR_PIECE_POLL_MAX_ATTEMPTS;
+        int ensure_piece_max_retries = DEFAULT_ENSURE_PIECE_MAX_RETRIES;
+        int deadline_reemit_interval_ms = DEFAULT_DEADLINE_REEMIT_INTERVAL_MS;
+        int startup_buffer_pieces = DEFAULT_STARTUP_BUFFER_PIECES;
+        int tail_pieces = DEFAULT_TAIL_PIECES;
+        bool enable_tail_prefetch = DEFAULT_ENABLE_TAIL_PREFETCH;
+    };
 
-    static std::unique_ptr<httplib::Server> g_server;
-    static std::thread           g_server_thread;
-    static std::string           g_url_buffer;
-    static std::mutex            g_url_mutex;
+    static StreamingConfig g_config;              // default-init
+    static std::mutex g_config_mutex;
 
-    static lt::session* g_session = nullptr;     // para futura migración a alertas
+    // Public function to update configuration (must be called before start_server)
+    void configure_streaming(const StreamingConfig& cfg) {
+        std::lock_guard<std::mutex> lk(g_config_mutex);
+        g_config = cfg;
+    }
 
-    // ── Caché LRU ───────────────────────────────────────────────────
-    static std::mutex g_cache_mutex;
-    struct CacheEntry { int piece_index; std::shared_ptr<std::vector<char>> data; };
-    static std::list<CacheEntry> g_cache_list;
-    static std::unordered_map<int, decltype(g_cache_list)::iterator> g_cache_map;
-    static size_t g_cache_current_size = 0;
+    // Thread-safe copy of the current configuration
+    static StreamingConfig get_config() {
+        std::lock_guard<std::mutex> lk(g_config_mutex);
+        return g_config;
+    }
 
-    static void cache_put(int piece_idx, std::shared_ptr<std::vector<char>> data) {
-        std::lock_guard<std::mutex> lock(g_cache_mutex);
-        auto it = g_cache_map.find(piece_idx);
-        if (it != g_cache_map.end()) {
-            g_cache_current_size -= it->second->data->size();
-            g_cache_list.erase(it->second);
-            g_cache_map.erase(it);
+    // ════════════════════════════════════════════════════════════════════════
+    // StreamState — explicit streaming lifecycle
+    // ════════════════════════════════════════════════════════════════════════
+    enum class StreamState : int {
+        Bootstrap,  // prebuffering front + tail in parallel
+        Streaming   // sliding window mode
+    };
+
+    // ════════════════════════════════════════════════════════════════════════
+    // PieceCache — LRU cache of fully downloaded pieces in RAM
+    // ════════════════════════════════════════════════════════════════════════
+    class PieceCache {
+    public:
+        struct Entry {
+            int piece;
+            std::shared_ptr<std::vector<char>> data;
+        };
+
+        explicit PieceCache(int limit_mb) : limit_bytes_(static_cast<size_t>(limit_mb) * 1024 * 1024) {}
+
+        std::shared_ptr<std::vector<char>> get(int piece) {
+            std::lock_guard<std::mutex> lk(mu);
+            auto it = map.find(piece);
+            if (it == map.end()) return nullptr;
+            lru.splice(lru.begin(), lru, it->second);
+            return it->second->data;
         }
-        g_cache_list.push_front({ piece_idx, data });
-        g_cache_map[piece_idx] = g_cache_list.begin();
-        g_cache_current_size += data->size();
-        while (g_cache_current_size > CACHE_MAX_BYTES && !g_cache_list.empty()) {
-            auto last = std::prev(g_cache_list.end());
-            g_cache_current_size -= last->data->size();
-            g_cache_map.erase(last->piece_index);
-            g_cache_list.pop_back();
+
+        void put(int piece, std::shared_ptr<std::vector<char>> data) {
+            std::lock_guard<std::mutex> lk(mu);
+            if (map.count(piece)) {
+                bytes -= map[piece]->data->size();
+                lru.erase(map[piece]);
+                map.erase(piece);
+            }
+            lru.push_front({ piece, std::move(data) });
+            map[piece] = lru.begin();
+            bytes += lru.front().data->size();
+            trim();
+        }
+
+        bool contains(int piece) const {
+            std::lock_guard<std::mutex> lk(mu);
+            return map.find(piece) != map.end();
+        }
+
+    private:
+        void trim() {
+            while (bytes > limit_bytes_ && !lru.empty()) {
+                auto& back = lru.back();
+                bytes -= back.data->size();
+                map.erase(back.piece);
+                lru.pop_back();
+            }
+        }
+
+        mutable std::mutex mu;
+        std::list<Entry> lru;
+        std::unordered_map<int, std::list<Entry>::iterator> map;
+        size_t bytes = 0;
+        const size_t limit_bytes_;
+    };
+
+    // ════════════════════════════════════════════════════════════════════════
+    // PieceWaiter — condition-variable-based notification for piece readiness
+    // ════════════════════════════════════════════════════════════════════════
+    class PieceWaiter {
+    public:
+        void notify(int piece) {
+            {
+                std::lock_guard<std::mutex> lk(mu);
+                ready.insert(piece);
+            }
+            cv.notify_all();
+        }
+
+        bool wait(int piece, int timeout_ms) {
+            std::unique_lock<std::mutex> lk(mu);
+            return cv.wait_for(lk, std::chrono::milliseconds(timeout_ms),
+                [&] { return ready.count(piece) > 0; });
+        }
+
+        void reset(int piece) {
+            std::lock_guard<std::mutex> lk(mu);
+            ready.erase(piece);
+        }
+
+    private:
+        std::mutex mu;
+        std::condition_variable cv;
+        std::unordered_set<int> ready;
+    };
+
+    // ════════════════════════════════════════════════════════════════════════
+    // StreamSession — per-stream state (single file within a torrent)
+    // ════════════════════════════════════════════════════════════════════════
+    struct StreamSession {
+        lt::torrent_handle handle;
+        int file_index = -1;
+        int piece_size = 0;
+        int first_piece = -1;
+        int last_piece = -1;
+        int64_t file_offset = 0;
+        int64_t file_size = 0;
+        std::string mime;
+
+        std::unique_ptr<PieceCache> cache;
+        PieceWaiter waiter;
+
+        std::mutex inflight_mu;
+        std::unordered_set<int> inflight_reads;   // pieces we want to load into cache
+        std::unordered_set<int> pending_reads;    // pieces currently being read (single-flight)
+
+        std::atomic<int> read_head = 0;
+        int last_window_start = -1;
+        int last_window_end = -1;
+        std::atomic<int64_t> last_window_update_ms{ 0 };
+        std::mutex window_mu;
+
+        std::atomic<int64_t> last_range_pos = 0;
+        std::atomic<int64_t> last_range_ts = 0;
+
+        std::atomic<StreamState> state{ StreamState::Bootstrap };
+
+        // Configuration snapshot (captured at start)
+        StreamingConfig cfg;
+
+        ~StreamSession() {}
+    };
+
+    // ════════════════════════════════════════════════════════════════════════
+    // Global state
+    // ════════════════════════════════════════════════════════════════════════
+    static lt::session* g_session_ptr = nullptr;
+    static std::shared_ptr<StreamSession>       g_stream;
+    static std::mutex                           g_stream_mutex;
+    static std::atomic<bool>                    g_running = false;
+    static std::thread                          g_alert_thread;
+    static std::unique_ptr<httplib::Server>     g_http_server;
+    static std::thread                          g_http_thread;
+    static std::string                          g_last_error;
+
+    // ── Helpers ──────────────────────────────────────────────────────────
+
+    static int64_t now_ms() {
+        return std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+    }
+
+    static bool piece_available(lt::torrent_handle& h, int piece) {
+        auto st = h.status(lt::torrent_handle::query_pieces);
+        if (piece < 0) return false;
+        if (piece >= static_cast<int>(st.pieces.size())) return false;
+        return st.pieces[lt::piece_index_t(piece)];
+    }
+
+    static int compute_readahead(const std::shared_ptr<StreamSession>& s) {
+        auto st = s->handle.status();
+        int rate = st.download_payload_rate;
+        if (rate <= 0) return s->cfg.min_readahead;
+        int pps = std::max(1, rate / s->piece_size);
+        return std::clamp(pps * 8, s->cfg.min_readahead, s->cfg.max_readahead);
+    }
+
+    // ── Anchor piece helpers ─────────────────────────────────────────────
+
+    static bool is_anchor_piece(const std::shared_ptr<StreamSession>& s, int piece) {
+        if (piece == s->first_piece) return true;
+        if (piece >= s->last_piece - s->cfg.tail_pieces + 1) return true;
+        return false;
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // PiecePlan — pure decision, no libtorrent side effects
+    // ════════════════════════════════════════════════════════════════════════
+    struct PiecePlan {
+        std::vector<int> high_priority;
+        std::vector<int> low_priority;
+        std::vector<std::pair<int, int64_t>> deadlines;   // piece, deadline_ms
+    };
+
+    // Build a priority plan for a given playback position and state.
+    static PiecePlan build_piece_plan(const std::shared_ptr<StreamSession>& s,
+        int current_piece,
+        StreamState state,
+        int old_read_head = -1)
+    {
+        PiecePlan plan;
+        int ahead = compute_readahead(s);
+        int64_t base = now_ms();
+
+        if (state == StreamState::Bootstrap) {
+            int front_end = std::min(s->last_piece, s->first_piece + s->cfg.startup_buffer_pieces - 1);
+            for (int p = s->first_piece; p <= front_end; ++p)
+                plan.high_priority.push_back(p);
+
+            for (int i = 0; i < s->cfg.tail_pieces; ++i) {
+                int p = s->last_piece - i;
+                if (p > s->first_piece && p > front_end)
+                    plan.high_priority.push_back(p);
+            }
+
+            for (size_t i = 0; i < plan.high_priority.size(); ++i) {
+                int p = plan.high_priority[i];
+                if (p <= front_end) {
+                    int64_t dl = base + (i == 0 ? 500 : s->cfg.deadline_base_ms + static_cast<int>(i) * s->cfg.deadline_step_ms);
+                    plan.deadlines.push_back({ p, dl });
+                }
+                else {
+                    plan.deadlines.push_back({ p, base + 3000 + static_cast<int>(i) * 1000 });
+                }
+            }
+        }
+        else {
+            int new_start = std::max(s->first_piece, current_piece - s->cfg.back_window);
+            int new_end = std::min(s->last_piece, current_piece + ahead);
+
+            for (int p = new_start; p <= new_end; ++p)
+                plan.high_priority.push_back(p);
+
+            for (size_t i = 0; i < plan.high_priority.size(); ++i) {
+                int p = plan.high_priority[i];
+                int64_t dl = base + s->cfg.deadline_base_ms + static_cast<int>(i) * s->cfg.deadline_step_ms;
+                plan.deadlines.push_back({ p, dl });
+            }
+
+            auto add_anchor = [&](int p, int64_t dl_ms) {
+                if (std::find(plan.high_priority.begin(), plan.high_priority.end(), p)
+                    == plan.high_priority.end()) {
+                    plan.high_priority.push_back(p);
+                }
+                plan.deadlines.push_back({ p, base + dl_ms });
+                };
+            add_anchor(s->first_piece, 500);
+            for (int i = 0; i < s->cfg.tail_pieces; ++i) {
+                int p = s->last_piece - i;
+                if (p > s->first_piece)
+                    add_anchor(p, 1000 + i * 500);
+            }
+
+            int read_head = old_read_head >= 0
+                ? old_read_head
+                : s->read_head.load(std::memory_order_relaxed);
+            int dead_zone_end = std::max(s->first_piece, read_head - s->cfg.back_window * 2);
+            for (int p = s->first_piece; p < dead_zone_end; ++p) {
+                if (!is_anchor_piece(s, p))
+                    plan.low_priority.push_back(p);
+            }
+
+            int far_future_start = std::min(s->last_piece, current_piece + ahead * 2);
+            for (int p = far_future_start; p <= s->last_piece; ++p) {
+                if (!is_anchor_piece(s, p))
+                    plan.low_priority.push_back(p);
+            }
+        }
+
+        return plan;
+    }
+
+    // Apply a PiecePlan to the torrent handle.
+    static void apply_piece_plan(lt::torrent_handle& h, const PiecePlan& plan) {
+        for (int p : plan.high_priority) {
+            h.piece_priority(lt::piece_index_t(p), lt::download_priority_t{ 7 });
+        }
+        for (int p : plan.low_priority) {
+            h.piece_priority(lt::piece_index_t(p), lt::download_priority_t{ 1 });
+        }
+        for (auto& [p, dl] : plan.deadlines) {
+            h.set_piece_deadline(lt::piece_index_t(p), dl,
+                lt::torrent_handle::alert_when_available);
         }
     }
 
-    static std::shared_ptr<std::vector<char>> cache_get(int piece_idx) {
-        std::lock_guard<std::mutex> lock(g_cache_mutex);
-        auto it = g_cache_map.find(piece_idx);
-        if (it == g_cache_map.end()) return nullptr;
-        g_cache_list.splice(g_cache_list.begin(), g_cache_list, it->second);
-        return it->second->data;
+    // ── Transition check: move from Bootstrap to Streaming ──────────────
+    static void check_bootstrap_transition(std::shared_ptr<StreamSession> s) {
+        if (s->state.load(std::memory_order_relaxed) != StreamState::Bootstrap)
+            return;
+
+        int ready_count = 0;
+        int front_end = std::min(s->last_piece, s->first_piece + s->cfg.startup_buffer_pieces - 1);
+        for (int p = s->first_piece; p <= front_end; ++p) {
+            if (s->cache->contains(p)) ready_count++;
+        }
+
+        if (ready_count >= s->cfg.startup_buffer_pieces) {
+            s->state.store(StreamState::Streaming, std::memory_order_release);
+            STREAM_LOG("Startup buffer complete, entering streaming mode");
+            s->last_window_update_ms.store(0, std::memory_order_relaxed);
+        }
     }
 
-    static void cache_clear() {
-        std::lock_guard<std::mutex> lock(g_cache_mutex);
-        g_cache_list.clear(); g_cache_map.clear(); g_cache_current_size = 0;
+    // ── Sliding window update (time-throttled, state-aware) ────────────
+    static void update_window(std::shared_ptr<StreamSession> s, int current_piece) {
+        int64_t now = now_ms();
+        int64_t last = s->last_window_update_ms.load(std::memory_order_relaxed);
+
+        if ((now - last) < s->cfg.window_update_throttle_ms)
+            return;
+
+        std::lock_guard<std::mutex> lk(s->window_mu);
+        s->read_head.store(current_piece, std::memory_order_relaxed);
+        s->last_window_update_ms.store(now, std::memory_order_relaxed);
+
+        StreamState current_state = s->state.load(std::memory_order_acquire);
+        PiecePlan plan = build_piece_plan(s, current_piece, current_state);
+
+        // Cancel deadlines that are no longer in the active high‑priority set
+        if (s->last_window_start != -1 && s->last_window_end != -1) {
+            for (int p = s->last_window_start; p <= s->last_window_end; ++p) {
+                if (!is_anchor_piece(s, p) &&
+                    std::find(plan.high_priority.begin(), plan.high_priority.end(), p)
+                    == plan.high_priority.end()) {
+                    s->handle.reset_piece_deadline(lt::piece_index_t(p));
+                }
+            }
+        }
+
+        apply_piece_plan(s->handle, plan);
+
+        s->last_window_start = plan.high_priority.empty() ? current_piece : plan.high_priority.front();
+        s->last_window_end = plan.high_priority.empty() ? current_piece : plan.high_priority.back();
+
+        if (current_state == StreamState::Bootstrap)
+            check_bootstrap_transition(s);
     }
 
-    // ── Helpers ─────────────────────────────────────────────────────
+    // ── Background prefetch: only marks pieces as needed, never calls read_piece ──
+    static void prefetch_bootstrap_pieces(const std::shared_ptr<StreamSession>& s) {
+        if (!s->cfg.enable_tail_prefetch) return;
+        int front_end = std::min(s->last_piece, s->first_piece + s->cfg.startup_buffer_pieces - 1);
+        // Front buffer
+        for (int p = s->first_piece; p <= front_end; ++p) {
+            if (!s->cache->contains(p)) {
+                std::lock_guard<std::mutex> lk(s->inflight_mu);
+                s->inflight_reads.insert(p);   // mark as needed
+            }
+        }
+        // Tail anchors
+        for (int i = 0; i < s->cfg.tail_pieces; ++i) {
+            int p = s->last_piece - i;
+            if (p <= s->first_piece) continue;
+            if (!s->cache->contains(p)) {
+                std::lock_guard<std::mutex> lk(s->inflight_mu);
+                s->inflight_reads.insert(p);
+            }
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // alert_pump – the single owner of read_piece
+    // ════════════════════════════════════════════════════════════════════════
+#pragma warning(push)
+#pragma warning(disable : 26110)
+#pragma warning(disable : 26117)
+    static void alert_pump() {
+        while (g_running.load(std::memory_order_acquire)) {
+            std::vector<lt::alert*> alerts;
+            if (g_session_ptr) g_session_ptr->pop_alerts(&alerts);
+
+            std::shared_ptr<StreamSession> s;
+            {
+                std::lock_guard<std::mutex> lk(g_stream_mutex);
+                s = g_stream;
+            }
+            if (!s) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(15));
+                continue;
+            }
+
+            for (auto* a : alerts) {
+                if (auto* pf = lt::alert_cast<lt::piece_finished_alert>(a)) {
+                    int piece = static_cast<int>(pf->piece_index);
+                    bool issue_read = false;
+                    {
+                        std::lock_guard<std::mutex> lk(s->inflight_mu);
+                        // Only read if we need this piece, and it's not already being read
+                        if (s->inflight_reads.count(piece) > 0 &&
+                            s->pending_reads.insert(piece).second) {
+                            issue_read = true;
+                        }
+                    }
+                    if (issue_read) {
+                        // This is the ONLY place where read_piece is called
+                        s->handle.read_piece(lt::piece_index_t(piece));
+                    }
+                    // Always notify waiters – the piece might already be in cache
+                    s->waiter.notify(piece);
+                }
+                else if (auto* rp = lt::alert_cast<lt::read_piece_alert>(a)) {
+                    int piece = static_cast<int>(rp->piece);
+                    {
+                        std::lock_guard<std::mutex> lk(s->inflight_mu);
+                        s->pending_reads.erase(piece);
+                        s->inflight_reads.erase(piece);  // no longer needed since it's now in cache (or failed)
+                    }
+                    if (!rp->buffer || rp->size == 0) {
+                        // Read failed – do NOT re-issue immediately; the piece might still be available.
+                        // We simply re-insert it into inflight_reads so it can be retried later
+                        // when another piece_finished_alert arrives (if still available).
+                        // This avoids spawning threads that could duplicate read_piece.
+                        std::lock_guard<std::mutex> lk(s->inflight_mu);
+                        s->inflight_reads.insert(piece);   // re-mark as needed
+                        continue;
+                    }
+                    auto data = std::make_shared<std::vector<char>>();
+                    data->resize(rp->size);
+                    std::memcpy(data->data(), rp->buffer.get(), rp->size);
+                    s->cache->put(piece, std::move(data));
+                }
+                else if (lt::alert_cast<lt::torrent_error_alert>(a) ||
+                    lt::alert_cast<lt::file_error_alert>(a)) {
+                    STREAM_LOG("Critical error, stopping stream");
+                    g_running.store(false, std::memory_order_release);
+                    break;
+                }
+            }
+
+            // During Bootstrap, mark front and tail pieces as needed (if not yet in cache)
+            if (s && s->state.load(std::memory_order_acquire) == StreamState::Bootstrap) {
+                prefetch_bootstrap_pieces(s);
+            }
+
+            std::this_thread::sleep_for(std::chrono::milliseconds(15));
+        }
+    }
+#pragma warning(pop)
+    // ── ensure_piece – block until piece is in cache (NO read_piece call) ──
+    static bool ensure_piece(std::shared_ptr<StreamSession> s, int piece) {
+        if (s->cache->contains(piece)) return true;
+
+        bool is_anchor = is_anchor_piece(s, piece);
+        int max_attempts = is_anchor ? s->cfg.anchor_piece_poll_max_attempts : s->cfg.piece_poll_max_attempts;
+
+        // Mark as needed – the alert_pump will eventually issue read_piece when available
+        {
+            std::lock_guard<std::mutex> lk(s->inflight_mu);
+            s->inflight_reads.insert(piece);
+        }
+
+        // Set high priority and an initial urgent deadline so libtorrent downloads it quickly
+        s->handle.piece_priority(lt::piece_index_t(piece), lt::download_priority_t{ 7 });
+        s->handle.set_piece_deadline(lt::piece_index_t(piece),
+            now_ms() + 500,
+            lt::torrent_handle::alert_when_available);
+
+        bool success = false;
+        int64_t last_deadline_ms = now_ms();
+        for (int attempt = 0;
+            attempt < max_attempts && g_running.load(std::memory_order_acquire);
+            ++attempt) {
+            if (s->cache->contains(piece)) {
+                success = true;
+                break;
+            }
+
+            int64_t now = now_ms();
+
+            // Re-emit deadline if piece hasn't arrived yet (no read_piece involved)
+            bool still_needed = false;
+            {
+                std::lock_guard<std::mutex> lk(s->inflight_mu);
+                still_needed = (s->inflight_reads.count(piece) > 0);
+            }
+            if (still_needed && (now - last_deadline_ms) >= s->cfg.deadline_reemit_interval_ms) {
+                s->handle.piece_priority(lt::piece_index_t(piece), lt::download_priority_t{ 7 });
+                s->handle.set_piece_deadline(lt::piece_index_t(piece),
+                    now + (is_anchor ? 1000 : 500),
+                    lt::torrent_handle::alert_when_available);
+                last_deadline_ms = now;
+                STREAM_LOG("Re-emitting deadline for piece %d (anchor=%d, attempt=%d)",
+                    piece, is_anchor, attempt);
+            }
+
+            std::this_thread::sleep_for(std::chrono::milliseconds(s->cfg.piece_poll_interval_ms));
+        }
+
+        // We no longer erase from inflight_reads here; the alert_pump will do it when the piece
+        // arrives (or fails). This keeps the piece in the “wanted” set in case of re-requests.
+        return success;
+    }
+
+    // ── Seek detection ──────────────────────────────────────────────────
+    static bool is_seek(const std::shared_ptr<StreamSession>& s, uint64_t pos) {
+        int64_t prev = s->last_range_pos.exchange(static_cast<int64_t>(pos));
+        return std::llabs(static_cast<int64_t>(pos) - prev) > (8LL * 1024 * 1024);
+    }
+
+    // ── Cache hit ratio ─────────────────────────────────────────────────
+    static double cache_hit_ratio(const std::shared_ptr<StreamSession>& s,
+        int dest_piece, int ahead) {
+        int dest_end = std::min(s->last_piece, dest_piece + ahead);
+        int total = dest_end - dest_piece + 1;
+        if (total <= 0) return 0.0;
+        int cached = 0;
+        for (int p = dest_piece; p <= dest_end; ++p) {
+            if (s->cache->contains(p)) cached++;
+        }
+        return static_cast<double>(cached) / total;
+    }
+
+    // ── Seek logic ──────────────────────────────────────────────────────
+    static void handle_seek(std::shared_ptr<StreamSession> s, int dest_piece) {
+        int old_read_head = s->read_head.load(std::memory_order_relaxed);
+        StreamState current_state = s->state.load(std::memory_order_acquire);
+        PiecePlan plan = build_piece_plan(s, dest_piece, current_state, old_read_head);
+
+        apply_piece_plan(s->handle, plan);
+
+        s->last_window_start = plan.high_priority.empty() ? dest_piece : plan.high_priority.front();
+        s->last_window_end = plan.high_priority.empty() ? dest_piece : plan.high_priority.back();
+        s->last_window_update_ms.store(now_ms(), std::memory_order_relaxed);
+        s->read_head.store(dest_piece, std::memory_order_relaxed);
+    }
+
+    // ── stream_range ────────────────────────────────────────────────────
+    static bool stream_range(std::shared_ptr<StreamSession> s,
+        uint64_t offset, uint64_t length,
+        httplib::DataSink& sink) {
+        uint64_t end = std::min<uint64_t>(offset + length, s->file_size);
+        uint64_t pos = offset;
+        bool seeking = is_seek(s, offset);
+        int consecutive_failures = 0;
+
+        while (pos < end && g_running.load(std::memory_order_acquire)) {
+            int piece = static_cast<int>((s->file_offset + pos) / s->piece_size);
+            piece = std::clamp(piece, s->first_piece, s->last_piece);
+
+            if (seeking) {
+                int ahead = compute_readahead(s);
+                double ratio = cache_hit_ratio(s, piece, ahead);
+                if (ratio < 0.8) {
+                    handle_seek(s, piece);
+                }
+                else {
+                    update_window(s, piece);
+                }
+                seeking = false;
+            }
+            else {
+                update_window(s, piece);
+            }
+
+            STREAM_LOG("Serving piece %d (offset %llu)", piece,
+                static_cast<unsigned long long>(pos));
+
+            if (!ensure_piece(s, piece)) {
+                if (++consecutive_failures > s->cfg.ensure_piece_max_retries) {
+                    STREAM_LOG("Too many piece failures, aborting stream");
+                    return false;
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                continue;
+            }
+            consecutive_failures = 0;
+
+            auto data = s->cache->get(piece);
+            if (!data) continue;
+
+            uint64_t piece_start = static_cast<uint64_t>(piece) * s->piece_size;
+            uint64_t file_relative = piece_start - s->file_offset;
+            uint64_t offset_in_piece = pos - file_relative;
+
+            if (offset_in_piece >= data->size()) continue;
+
+            uint64_t available = data->size() - offset_in_piece;
+            uint64_t to_send = std::min<uint64_t>(available, end - pos);
+
+            if (!sink.write(data->data() + offset_in_piece, to_send))
+                return false;
+
+            pos += to_send;
+        }
+
+        return pos >= end;
+    }
+
+    // ── Utility functions (MIME, JSON, etc.) ────────────────────────────
+    static std::string detect_mime(const std::string& path) {
+        std::string lower = path;
+        std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
+        if (lower.ends_with(".mp4"))                           return "video/mp4";
+        if (lower.ends_with(".mkv"))                           return "video/x-matroska";
+        if (lower.ends_with(".avi"))                           return "video/x-msvideo";
+        if (lower.ends_with(".mov"))                           return "video/quicktime";
+        if (lower.ends_with(".wmv"))                           return "video/x-ms-wmv";
+        if (lower.ends_with(".webm"))                          return "video/webm";
+        if (lower.ends_with(".flv"))                           return "video/x-flv";
+        if (lower.ends_with(".m4v"))                           return "video/mp4";
+        if (lower.ends_with(".mpg") || lower.ends_with(".mpeg")) return "video/mpeg";
+        return "application/octet-stream";
+    }
+
     static std::string escape_json(const std::string& s) {
         std::ostringstream o;
-        for (char c : s) {
+        for (unsigned char c : s) {
             switch (c) {
             case '"':  o << "\\\""; break;
             case '\\': o << "\\\\"; break;
-            case '\b': o << "\\b";  break;
-            case '\f': o << "\\f";  break;
             case '\n': o << "\\n";  break;
             case '\r': o << "\\r";  break;
             case '\t': o << "\\t";  break;
             default:
-                if (static_cast<unsigned char>(c) < 0x20)
-                    o << "\\u00" << std::hex << static_cast<int>(static_cast<unsigned char>(c)) << std::dec;
-                else o << c;
+                if (c < 0x20) o << "\\u00" << std::hex << static_cast<int>(c) << std::dec;
+                else          o << static_cast<char>(c);
             }
         }
         return o.str();
     }
 
-    static std::string detect_mime(const std::string& path) {
-        std::string lower = path;
-        std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
-        if (lower.ends_with(".mp4"))  return "video/mp4";
-        if (lower.ends_with(".mkv"))  return "video/x-matroska";
-        if (lower.ends_with(".avi"))  return "video/x-msvideo";
-        if (lower.ends_with(".mov"))  return "video/quicktime";
-        if (lower.ends_with(".wmv"))  return "video/x-ms-wmv";
-        if (lower.ends_with(".webm")) return "video/webm";
-        if (lower.ends_with(".flv"))  return "video/x-flv";
-        if (lower.ends_with(".m4v"))  return "video/mp4";
-        if (lower.ends_with(".mpg") || lower.ends_with(".mpeg")) return "video/mpeg";
-        return "application/octet-stream";
-    }
-
-    static std::string build_status_json() {
+    static std::string build_status_json(const std::shared_ptr<StreamSession>& sess) {
+        if (!sess || !sess->handle.is_valid())
+            return R"({"error":"no active session"})";
         try {
-            lt::torrent_handle h;
-            int f_idx, p_size;
-            std::int64_t f_off, f_sz;
-            {
-                std::lock_guard<std::mutex> lock(g_state_mutex);
-                if (!g_handle.is_valid()) return R"({"error":"no handle"})";
-                h = g_handle; f_idx = g_file_index; p_size = g_piece_size;
-                f_off = g_file_offset; f_sz = g_file_size;
-            }
-            lt::torrent_status st = h.status();
+            lt::torrent_status st = sess->handle.status(
+                lt::torrent_handle::query_pieces |
+                lt::torrent_handle::query_accurate_download_counters);
+
             auto ti = st.torrent_file.lock();
-            if (!ti) return R"({"error":"no metadata"})";
 
             std::ostringstream j;
-            j << "{\n  \"torrent\": {\n"
-                << "    \"progress\": " << st.progress << ",\n"
-                << "    \"download_rate\": " << st.download_payload_rate << ",\n"
-                << "    \"upload_rate\": " << st.upload_payload_rate << ",\n"
-                << "    \"num_peers\": " << st.num_peers << ",\n"
-                << "    \"num_seeds\": " << st.num_seeds << ",\n"
-                << "    \"total_downloaded\": " << st.total_payload_download << ",\n"
-                << "    \"is_finished\": " << (st.is_finished ? "true" : "false") << "\n  }";
+            j << "{\n"
+                << "  \"progress\":" << st.progress << ",\n"
+                << "  \"download_rate\":" << st.download_payload_rate << ",\n"
+                << "  \"upload_rate\":" << st.upload_payload_rate << ",\n"
+                << "  \"num_peers\":" << st.num_peers << ",\n"
+                << "  \"num_seeds\":" << st.num_seeds << ",\n"
+                << "  \"is_finished\":" << (st.is_finished ? "true" : "false") << ",\n";
 
-            if (f_idx >= 0 && f_idx < ti->files().num_files()) {
+            if (ti) {
                 const auto& files = ti->files();
-                lt::file_index_t fidx{ f_idx };
-                std::vector<std::int64_t> fprog; h.file_progress(fprog);
-                std::int64_t file_down = (f_idx < (int)fprog.size()) ? fprog[f_idx] : 0;
-
-                int first_piece = static_cast<int>(files.file_offset(fidx) / p_size);
-                int last_piece = static_cast<int>((files.file_offset(fidx) + f_sz - 1) / p_size);
-                int dl_pieces = 0, first_missing = -1;
-                const auto& pieces = st.pieces;
-                for (int i = first_piece; i <= last_piece; ++i) {
-                    bool have = (i >= 0 && i < (int)pieces.size()) && pieces[lt::piece_index_t(i)];
-                    if (have) dl_pieces++;
-                    else if (first_missing < 0) first_missing = i;
-                }
-                int first_missing_rel = (first_missing >= 0) ? (first_missing - first_piece) : -1;
-                std::int64_t contiguous = (first_missing >= 0)
-                    ? std::min((std::int64_t)(first_missing - first_piece) * p_size, f_sz) : f_sz;
+                lt::file_index_t fidx(sess->file_index);
+                std::vector<int64_t> fprog;
+                sess->handle.file_progress(fprog);
+                int64_t file_down = (sess->file_index < static_cast<int>(fprog.size()))
+                    ? fprog[sess->file_index] : 0;
 
                 j << ",\n  \"file\": {\n"
-                    << "    \"index\": " << f_idx << ",\n"
-                    << "    \"name\": \"" << escape_json(std::string(files.file_name(fidx))) << "\",\n"
-                    << "    \"size\": " << f_sz << ",\n"
-                    << "    \"offset_in_torrent\": " << f_off << ",\n"
-                    << "    \"downloaded_bytes\": " << file_down << ",\n"
-                    << "    \"progress\": " << (f_sz > 0 ? (double)file_down / f_sz : 0.0) << ",\n"
-                    << "    \"total_pieces\": " << (last_piece - first_piece + 1) << ",\n"
-                    << "    \"downloaded_pieces\": " << dl_pieces << ",\n"
-                    << "    \"first_missing_piece\": " << first_missing_rel << ",\n"
-                    << "    \"contiguous_completed_bytes\": " << contiguous << "\n  }";
+                    << "    \"index\":" << sess->file_index << ",\n"
+                    << "    \"name\":\"" << escape_json(std::string(files.file_name(fidx))) << "\",\n"
+                    << "    \"size\":" << sess->file_size << ",\n"
+                    << "    \"downloaded\":" << file_down << ",\n"
+                    << "    \"progress\":" << (sess->file_size > 0 ? static_cast<double>(file_down) / sess->file_size : 0.0) << ",\n"
+                    << "    \"first_piece\":" << sess->first_piece << ",\n"
+                    << "    \"last_piece\":" << sess->last_piece << "\n"
+                    << "  }";
             }
             j << "\n}";
             return j.str();
         }
-        catch (...) { return R"({"error":"internal error"})"; }
+        catch (...) {
+            return R"({"error":"internal error"})";
+        }
     }
 
-    // ══════════════════════════════════════════════════════════════════
-    // TorrentContentProvider – con ventana incremental y file_mutex
-    // ══════════════════════════════════════════════════════════════════
-    class TorrentContentProvider {
-    public:
-        TorrentContentProvider(const std::string& path, lt::torrent_handle handle,
-            std::int64_t file_offset, std::int64_t file_size,
-            std::int64_t piece_size, int file_index)
-            : handle_(std::move(handle)), file_offset_(file_offset),
-            file_size_(file_size), piece_size_(piece_size),
-            file_path_(path), file_index_(file_index)
-        {
-            if (piece_size_ > 0) {
-                int64_t total_pieces = (file_size_ + piece_size_ - 1) / piece_size_;
-                int64_t ahead_bytes = READAHEAD_BYTES;
-                readahead_pieces_ = std::max<int64_t>(1, ahead_bytes / piece_size_);
-                if (readahead_pieces_ > total_pieces) readahead_pieces_ = static_cast<int>(total_pieces);
-            }
-            else readahead_pieces_ = 1;
-            last_deadline_update_ = std::chrono::steady_clock::now() - std::chrono::milliseconds(DEADLINE_UPDATE_INTERVAL_MS * 2);
-            last_range_start_ = 0;
-            last_window_start_ = -1;
-            last_window_end_ = -1;
+    // ════════════════════════════════════════════════════════════════════════
+    // Public API
+    // ════════════════════════════════════════════════════════════════════════
+
+    bool start_server(lt::session* session, lt::torrent_handle* handle_ptr,
+        int32_t file_index, int32_t port, std::string& out_url)
+    {
+        if (g_running.load(std::memory_order_acquire)) {
+            g_running.store(false, std::memory_order_release);
+            return false;
         }
-        ~TorrentContentProvider() { close_file(); }
-
-        bool operator()(uint64_t offset, uint64_t length, httplib::DataSink& sink) {
-            try {
-                if (offset >= static_cast<uint64_t>(file_size_)) return false;
-                uint64_t end_req = std::min(offset + length, static_cast<uint64_t>(file_size_));
-
-                if (offset != last_range_start_) {
-                    last_range_start_ = offset;
-                    int start_piece = static_cast<int>((file_offset_ + offset) / piece_size_);
-                    prioritize_seek_range(start_piece);
-                }
-
-                uint64_t current = offset;
-
-                while (current < end_req && g_running.load(std::memory_order_acquire)) {
-                    std::int64_t abs_pos = file_offset_ + static_cast<std::int64_t>(current);
-                    int piece_idx = static_cast<int>(abs_pos / piece_size_);
-
-                    update_download_window(piece_idx);
-
-                    if (size_t n = serve_from_cache(piece_idx, current, end_req, sink)) {
-                        current += n;
-                        continue;
-                    }
-                    if (is_piece_downloaded(piece_idx)) {
-                        if (load_piece_into_cache(piece_idx)) continue;
-                    }
-                    handle_.set_piece_deadline(lt::piece_index_t(piece_idx), now_ms() + 3000,
-                        lt::torrent_handle::alert_when_available);
-                    std::this_thread::sleep_for(std::chrono::milliseconds(PIECE_POLL_INTERVAL_MS));
-                }
-                return true;
-            }
-            catch (const std::exception& e) {
-                STREAM_LOG("Exception in ContentProvider: %s", e.what());
-                return false;
-            }
-            catch (...) { STREAM_LOG("Unknown exception in ContentProvider"); return false; }
-        }
-
-    private:
-        int64_t now_ms() const {
-            return std::chrono::duration_cast<std::chrono::milliseconds>(
-                std::chrono::steady_clock::now().time_since_epoch()).count();
-        }
-
-        // ── Ventana incremental ───────────────────────────────────────
-        void update_download_window(int piece_idx) {
-            auto now = std::chrono::steady_clock::now();
-            {
-                std::lock_guard<std::mutex> lock(provider_mutex_);
-                if (piece_idx == last_piece_idx_ &&
-                    now - last_deadline_update_ < std::chrono::milliseconds(DEADLINE_UPDATE_INTERVAL_MS))
-                    return;
-            }
-
-            if (!handle_.is_valid()) return;
-
-            auto ms = now_ms();
-            int first = static_cast<int>(file_offset_ / piece_size_);
-            int last = static_cast<int>((file_offset_ + file_size_ - 1) / piece_size_);
-
-            int new_start = piece_idx;
-            int new_end = std::min(piece_idx + readahead_pieces_, last);
-
-            int old_start = (last_window_start_ >= 0) ? last_window_start_ : new_start;
-            int old_end = (last_window_end_ >= 0) ? last_window_end_ : new_end;
-
-            // ── Deshabilitar piezas que salieron de la ventana ────────
-            for (int p = old_start; p < new_start && p <= old_end; ++p) {
-                if (p < last - 2) {
-                    handle_.reset_piece_deadline(lt::piece_index_t(p));
-                    handle_.piece_priority(lt::piece_index_t(p), lt::download_priority_t{ 0 });
-                }
-            }
-
-            // ── Habilitar piezas que entraron en la ventana ───────────
-            for (int p = std::max(new_start, old_end + 1); p <= new_end; ++p) {
-                handle_.piece_priority(lt::piece_index_t(p), lt::download_priority_t{ 7 });
-            }
-
-            // ── Deadlines en la ventana ───────────────────────────────
-            handle_.set_piece_deadline(lt::piece_index_t(piece_idx), ms + PIECE_DEADLINE_CURRENT_MS,
-                lt::torrent_handle::alert_when_available);
-            for (int p = piece_idx + 1; p <= new_end; ++p) {
-                int64_t dl = ms + PIECE_DEADLINE_CURRENT_MS + (p - piece_idx) * PIECE_DEADLINE_STEP_MS;
-                if (dl > ms + PIECE_DEADLINE_MAX_MS) dl = ms + PIECE_DEADLINE_MAX_MS;
-                handle_.set_piece_deadline(lt::piece_index_t(p), dl, lt::torrent_handle::alert_when_available);
-            }
-
-            // ── Mantener últimas 3 piezas (metadatos) ─────────────────
-            for (int i = 0; i < 3 && (last - i) >= first; ++i) {
-                int p = last - i;
-                if (p > new_end)
-                    handle_.piece_priority(lt::piece_index_t(p), lt::download_priority_t{ 7 });
-            }
-
-            {
-                std::lock_guard<std::mutex> lock(provider_mutex_);
-                last_piece_idx_ = piece_idx;
-                last_deadline_update_ = now;
-                last_window_start_ = new_start;
-                last_window_end_ = new_end;
-            }
-        }
-
-        void prioritize_seek_range(int piece_idx) {
-            if (!handle_.is_valid()) return;
-            auto ms = now_ms();
-            int last = static_cast<int>((file_offset_ + file_size_ - 1) / piece_size_);
-            handle_.set_piece_deadline(lt::piece_index_t(piece_idx), ms + 500, lt::torrent_handle::alert_when_available);
-            handle_.piece_priority(lt::piece_index_t(piece_idx), lt::download_priority_t{ 7 });
-            for (int i = 1; i <= 2; ++i) {
-                int p = piece_idx + i;
-                if (p <= last) {
-                    handle_.set_piece_deadline(lt::piece_index_t(p), ms + 1000 + i * 500,
-                        lt::torrent_handle::alert_when_available);
-                    handle_.piece_priority(lt::piece_index_t(p), lt::download_priority_t{ 7 });
-                }
-            }
-        }
-
-        bool is_piece_downloaded(int piece_idx) {
-            if (!handle_.is_valid()) return false;
-            lt::torrent_status st = handle_.status(lt::torrent_handle::query_pieces);
-            return piece_idx >= 0 && piece_idx < static_cast<int>(st.pieces.size()) &&
-                st.pieces[lt::piece_index_t(piece_idx)];
-        }
-
-        size_t serve_from_cache(int piece_idx, uint64_t current, uint64_t end, httplib::DataSink& sink) {
-            auto data = cache_get(piece_idx);
-            if (!data) return 0;
-            int64_t piece_start = static_cast<int64_t>(piece_idx) * piece_size_;
-            uint64_t off = current - piece_start;
-            if (off >= data->size()) return 0;
-            uint64_t to_copy = std::min<uint64_t>(end - current, data->size() - off);
-            if (to_copy == 0) return 0;
-            if (!sink.write(&(*data)[off], static_cast<size_t>(to_copy))) return 0;
-            return static_cast<size_t>(to_copy);
-        }
-
-        bool load_piece_into_cache(int piece_idx) {
-            if (cache_get(piece_idx)) return true;
-            if (!open_file_if_needed()) return false;
-            int64_t piece_start = static_cast<int64_t>(piece_idx) * piece_size_;
-            int64_t piece_end = std::min(file_offset_ + file_size_, piece_start + piece_size_);
-            int64_t piece_length = piece_end - piece_start;
-            if (piece_length <= 0) return false;
-            for (int attempt = 0; attempt < 3; ++attempt) {
-                auto buffer = std::make_shared<std::vector<char>>(piece_length);
-                if (!seek_file(piece_start)) { std::this_thread::sleep_for(std::chrono::milliseconds(50)); continue; }
-                size_t n;
-                {
-                    std::lock_guard<std::mutex> lock(file_mutex_);
-                    n = fread(buffer->data(), 1, piece_length, file_);
-                }
-                if (n == static_cast<size_t>(piece_length)) { cache_put(piece_idx, buffer); return true; }
-                clearerr(file_);
-                std::this_thread::sleep_for(std::chrono::milliseconds(100));
-            }
+        if (!handle_ptr || !handle_ptr->is_valid()) {
             return false;
         }
 
-        bool open_file_if_needed() { if (!file_) return open_file(); return true; }
-        bool open_file() {
-            close_file();
-#ifdef _WIN32
-            int wlen = MultiByteToWideChar(CP_UTF8, 0, file_path_.c_str(), -1, nullptr, 0);
-            if (wlen > 0) {
-                std::wstring wpath(wlen, L'\0');
-                MultiByteToWideChar(CP_UTF8, 0, file_path_.c_str(), -1, &wpath[0], wlen);
-                file_ = _wfsopen(wpath.c_str(), L"rb", _SH_DENYNO);
+        g_session_ptr = session;
+        lt::torrent_handle h = *handle_ptr;
+
+        // ── Apply streaming-optimized session settings ─────────────────
+        if (session) {
+            lt::settings_pack sp;
+
+            sp.set_int(lt::settings_pack::alert_mask,
+                lt::alert_category::status |
+                lt::alert_category::storage |
+                lt::alert_category::error |
+                lt::alert_category::piece_progress);
+
+            sp.set_int(lt::settings_pack::connections_limit, 300);
+            sp.set_int(lt::settings_pack::max_out_request_queue, 2500);
+            sp.set_int(lt::settings_pack::max_allowed_in_request_queue, 2500);
+            sp.set_int(lt::settings_pack::request_queue_time, 1);
+
+            sp.set_int(lt::settings_pack::whole_pieces_threshold, 0);
+            sp.set_bool(lt::settings_pack::smooth_connects, false);
+
+            sp.set_int(lt::settings_pack::disk_io_read_mode, lt::settings_pack::enable_os_cache);
+            sp.set_int(lt::settings_pack::disk_io_write_mode, lt::settings_pack::enable_os_cache);
+            sp.set_int(lt::settings_pack::max_queued_disk_bytes, 128 * 1024 * 1024);
+            sp.set_int(lt::settings_pack::aio_threads, 8);
+            sp.set_int(lt::settings_pack::file_pool_size, 60);
+
+            sp.set_bool(lt::settings_pack::strict_end_game_mode, false);
+
+            sp.set_bool(lt::settings_pack::enable_dht, true);
+            sp.set_bool(lt::settings_pack::enable_lsd, true);
+            sp.set_bool(lt::settings_pack::enable_upnp, true);
+            sp.set_bool(lt::settings_pack::enable_natpmp, true);
+
+            session->apply_settings(sp);
+            STREAM_LOG("Streaming session configured");
+        }
+
+        lt::torrent_status st = h.status();
+        auto ti = st.torrent_file.lock();
+        if (!ti) return false;
+
+        const auto& files = ti->files();
+        if (file_index < 0 || file_index >= files.num_files()) return false;
+
+        lt::file_index_t fidx{ file_index };
+        int64_t fsize = files.file_size(fidx);
+        int64_t foff = files.file_offset(fidx);
+        int psize = ti->piece_length();
+        int fp = static_cast<int>(foff / psize);
+        int lp = static_cast<int>((foff + fsize - 1) / psize);
+
+        auto s = std::make_shared<StreamSession>();
+        s->handle = h;
+        s->file_index = file_index;
+        s->piece_size = psize;
+        s->file_offset = foff;
+        s->file_size = fsize;
+        s->first_piece = fp;
+        s->last_piece = lp;
+        s->mime = detect_mime(files.file_path(fidx));
+        s->state.store(StreamState::Bootstrap, std::memory_order_release);
+        s->cfg = get_config();   // snapshot current configuration
+
+        // Create cache with configured limit
+        s->cache = std::make_unique<PieceCache>(s->cfg.cache_limit_mb);
+
+        {
+            std::lock_guard<std::mutex> lk(g_stream_mutex);
+            g_stream = s;
+        }
+
+        // Start the alert pump thread before initial window update
+        g_running.store(true, std::memory_order_release);
+        g_alert_thread = std::thread(alert_pump);
+
+        // Force bootstrap plan update
+        s->last_window_update_ms.store(0, std::memory_order_relaxed);
+        update_window(s, fp);
+
+        // Mark first piece as needed; alert_pump will handle the actual read_piece
+        {
+            std::lock_guard<std::mutex> lk(s->inflight_mu);
+            s->inflight_reads.insert(fp);
+        }
+
+        // Set an urgent deadline so libtorrent downloads it with priority
+        h.set_piece_deadline(lt::piece_index_t(fp), now_ms() + 500,
+            lt::torrent_handle::alert_when_available);
+        h.piece_priority(lt::piece_index_t(fp), lt::download_priority_t{ 7 });
+
+        // ── HTTP server setup ──────────────────────────────────────────
+        if (g_http_server) {
+            g_http_server->stop();
+            if (g_http_thread.joinable()) g_http_thread.join();
+        }
+        g_http_server = std::make_unique<httplib::Server>();
+
+        g_http_server->set_keep_alive_timeout(300);
+        g_http_server->set_keep_alive_max_count(10000);
+        g_http_server->set_read_timeout(60, 0);
+        g_http_server->set_write_timeout(120, 0);
+        g_http_server->set_tcp_nodelay(true);
+
+        auto add_cors = [](httplib::Response& res) {
+            res.set_header("Access-Control-Allow-Origin", "*");
+            res.set_header("Access-Control-Allow-Headers", "Range, If-None-Match");
+            res.set_header("Access-Control-Expose-Headers",
+                "Content-Range, Content-Length, Accept-Ranges, ETag");
+            };
+
+        g_http_server->Get("/stream", [s, add_cors](const httplib::Request&,
+            httplib::Response& res) {
+                add_cors(res);
+                res.set_header("Accept-Ranges", "bytes");
+                res.set_content_provider(
+                    s->file_size,
+                    s->mime,
+                    [s](uint64_t off, uint64_t len, httplib::DataSink& sink) -> bool {
+                        return stream_range(s, off, len, sink);
+                    });
+            });
+
+        g_http_server->Get("/status", [s, add_cors](const httplib::Request&,
+            httplib::Response& res) {
+                res.set_content(build_status_json(s), "application/json");
+                add_cors(res);
+            });
+
+        g_http_server->Options(R"(.*)", [add_cors](const httplib::Request&,
+            httplib::Response& res) {
+                add_cors(res);
+                res.status = 204;
+            });
+
+        g_http_thread = std::thread([port]() {
+            try {
+                g_http_server->listen("127.0.0.1", port);
             }
-            else return false;
-#else
-            file_ = fopen(file_path_.c_str(), "rb");
-#endif
-            return file_ != nullptr;
+            catch (...) {}
+            });
+
+        char url_buf[128];
+        std::snprintf(url_buf, sizeof(url_buf), "http://127.0.0.1:%d/stream", port);
+        out_url = url_buf;
+        return true;
+    }
+
+    void stop_server() {
+        g_running.store(false, std::memory_order_release);
+
+        if (g_alert_thread.joinable()) g_alert_thread.join();
+
+        if (g_http_server) {
+            g_http_server->stop();
+            if (g_http_thread.joinable()) g_http_thread.join();
         }
-        void close_file() { if (file_) { fclose(file_); file_ = nullptr; } }
 
-        bool seek_file(int64_t pos) {
-            std::lock_guard<std::mutex> lock(file_mutex_);
-#ifdef _WIN32
-            return _fseeki64(file_, static_cast<__int64>(pos), SEEK_SET) == 0;
-#else
-            return fseeko(file_, static_cast<off_t>(pos), SEEK_SET) == 0;
-#endif
+        {
+            std::lock_guard<std::mutex> lk(g_stream_mutex);
+            g_stream.reset();
         }
+        g_http_server.reset();
+    }
 
-        lt::torrent_handle handle_;
-        std::int64_t file_offset_, file_size_, piece_size_;
-        std::string file_path_;
-        int file_index_;
-        int readahead_pieces_ = 1;
-        int last_piece_idx_ = -1;
-        std::chrono::steady_clock::time_point last_deadline_update_;
-        std::mutex provider_mutex_;
-        std::mutex file_mutex_;   // protege las operaciones sobre file_
-        FILE* file_ = nullptr;
-        uint64_t last_range_start_ = 0;
-        int last_window_start_ = -1;
-        int last_window_end_ = -1;
-    };
+    bool is_running() {
+        return g_running.load(std::memory_order_acquire);
+    }
 
-    // ── Funciones de seek ─────────────────────────────────────────────
-    bool is_byte_available(lt::torrent_handle* handle, int32_t file_index, int64_t byte_position) {
+    const char* last_error() {
+        return g_last_error.c_str();
+    }
+
+    void reset_state() {
+        stop_server();
+        g_session_ptr = nullptr;
+    }
+
+    bool is_byte_available(lt::torrent_handle* handle, int32_t file_index,
+        int64_t byte_position) {
         if (!handle || !handle->is_valid()) return false;
         try {
             auto ti = handle->torrent_file();
-            if (!ti || file_index < 0 || file_index >= ti->files().num_files()) return false;
+            if (!ti || file_index < 0 || file_index >= ti->files().num_files())
+                return false;
             auto abs = ti->files().file_offset(lt::file_index_t(file_index)) + byte_position;
             int pi = static_cast<int>(abs / ti->piece_length());
             auto st = handle->status(lt::torrent_handle::query_pieces);
-            return pi >= 0 && pi < (int)st.pieces.size() && st.pieces[lt::piece_index_t(pi)];
+            return pi >= 0 && pi < static_cast<int>(st.pieces.size()) &&
+                st.pieces[lt::piece_index_t(pi)];
         }
-        catch (...) { return false; }
+        catch (...) {
+            return false;
+        }
     }
 
-    bool prioritize_seek_range(lt::torrent_handle* handle, int32_t file_index, int64_t byte_position, int64_t piece_size) {
+    bool prioritize_seek_range(lt::torrent_handle* handle, int32_t file_index,
+        int64_t byte_position, int64_t piece_size) {
         if (!handle || !handle->is_valid() || piece_size <= 0) return false;
         try {
             auto ti = handle->torrent_file();
-            if (!ti || file_index < 0 || file_index >= ti->files().num_files()) return false;
+            if (!ti || file_index < 0 || file_index >= ti->files().num_files())
+                return false;
             auto abs = ti->files().file_offset(lt::file_index_t(file_index)) + byte_position;
             int pi = static_cast<int>(abs / piece_size);
             auto now = std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::steady_clock::now().time_since_epoch()).count();
             handle->set_piece_deadline(lt::piece_index_t(pi), now + 1500);
-            int last = static_cast<int>((ti->files().file_offset(lt::file_index_t(file_index)) +
-                ti->files().file_size(lt::file_index_t(file_index)) - 1) / piece_size);
+            int last = static_cast<int>(
+                (ti->files().file_offset(lt::file_index_t(file_index)) +
+                    ti->files().file_size(lt::file_index_t(file_index)) - 1) / piece_size);
             for (int p = pi + 1; p <= std::min(pi + 2, last); ++p)
                 handle->set_piece_deadline(lt::piece_index_t(p), now + 3000 + (p - pi) * 2000);
             return true;
         }
-        catch (...) { return false; }
+        catch (...) {
+            return false;
+        }
     }
 
-    // ── start_server con ventana estricta y configuración aplicada ───
-    bool start_server(lt::session* session, lt::torrent_handle* handle_ptr, int32_t file_index,
-        int32_t port, std::string& out_url) {
-        g_session = session;
-        try {
-            if (g_running.load(std::memory_order_acquire)) { g_last_error = "Server already running"; return false; }
-            if (!handle_ptr || !handle_ptr->is_valid()) { g_last_error = "Invalid torrent handle"; return false; }
-
-            lt::torrent_handle h = *handle_ptr;
-
-            // ─── Aplicar configuración de streaming ────────────────────
-            lt::settings_pack sp;
-            sp.set_int(lt::settings_pack::request_queue_time, 2);
-            sp.set_int(lt::settings_pack::whole_pieces_threshold, 0);
-            sp.set_int(lt::settings_pack::max_out_request_queue, 2000);
-            sp.set_int(lt::settings_pack::max_allowed_in_request_queue, 2000);
-            sp.set_bool(lt::settings_pack::strict_end_game_mode, false);
-            if (session) session->apply_settings(sp);
-            STREAM_LOG("Configuración de streaming aplicada (request_queue_time=2)");
-
-            lt::torrent_status st = h.status();
-            auto ti = st.torrent_file.lock();
-            if (!ti) { g_last_error = "Torrent has no metadata yet"; return false; }
-            const auto& files = ti->files();
-            if (file_index < 0 || file_index >= files.num_files()) { g_last_error = "File index out of range"; return false; }
-
-            lt::file_index_t fidx{ file_index };
-            std::filesystem::path save_path(st.save_path);
-            std::string full_path = (save_path / files.file_path(fidx)).string();
-            int64_t fsize = files.file_size(fidx);
-            int64_t foff = files.file_offset(fidx);
-            int psize = ti->piece_length();
-            std::string mime = detect_mime(full_path);
-
-            {
-                std::lock_guard<std::mutex> lock(g_state_mutex);
-                g_handle = h; g_file_index = file_index; g_file_path = full_path;
-                g_file_size = fsize; g_file_offset = foff; g_piece_size = psize;
-                g_mime_type = mime;
-                std::ostringstream etag; etag << "\"" << st.info_hashes.get_best() << "-" << file_index << "\"";
-                g_etag = etag.str(); g_last_error.clear();
-            }
-
-            if (psize > 0 && fsize > 0) {
-                int first = static_cast<int>(foff / psize);
-                int last = static_cast<int>((foff + fsize - 1) / psize);
-
-                // 1. Bloquear todo (prioridad 0)
-                for (int p = first; p <= last; ++p)
-                    h.piece_priority(lt::piece_index_t(p), lt::download_priority_t{ 0 });
-
-                // 2. Permitir solo la ventana inicial de read‑ahead (~16 MiB)
-                int ahead_pieces = std::max(1, static_cast<int>(READAHEAD_BYTES / psize));
-                int max_ahead = std::min(first + ahead_pieces - 1, last);
-                for (int p = first; p <= max_ahead; ++p)
-                    h.piece_priority(lt::piece_index_t(p), lt::download_priority_t{ 7 });
-
-                // 3. Permitir las últimas 3 piezas (metadatos)
-                for (int i = 0; i < 3 && (last - i) >= first; ++i)
-                    h.piece_priority(lt::piece_index_t(last - i), lt::download_priority_t{ 7 });
-
-                // 4. Precarga mínima (solo primera pieza)
-                auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(PRECARGA_TIMEOUT_SEC);
-                auto check_ready = [&]() -> bool {
-                    lt::torrent_status st = h.status(lt::torrent_handle::query_pieces);
-                    bool first_ok = (first >= 0 && first < (int)st.pieces.size() && st.pieces[lt::piece_index_t(first)]);
-                    return first_ok;
-                    };
-                while (std::chrono::steady_clock::now() < deadline && !check_ready())
-                    std::this_thread::sleep_for(std::chrono::milliseconds(200));
-            }
-
-            // ── HTTP server ─────────────────────────────────────────
-            g_server = std::make_unique<httplib::Server>();
-            g_server->set_exception_handler([](const httplib::Request&, httplib::Response& res, std::exception_ptr) {
-                res.status = 500; res.set_content("Internal Server Error", "text/plain");
-                });
-            g_server->set_payload_max_length(512 * 1024 * 1024);
-            g_server->set_keep_alive_max_count(10000);
-            g_server->set_keep_alive_timeout(300);
-            g_server->set_read_timeout(0, 0);
-            g_server->set_write_timeout(0, 0);
-            g_server->set_tcp_nodelay(true);
-
-            auto add_cors = [](httplib::Response& res) {
-                res.set_header("Access-Control-Allow-Origin", "*");
-                res.set_header("Access-Control-Allow-Headers", "Range");
-                res.set_header("Access-Control-Expose-Headers", "Content-Range, Content-Length, Accept-Ranges");
-                };
-
-            auto file_path = g_file_path, mime_val = g_mime_type, etag_val = g_etag;
-            auto handle = g_handle; int f_idx = g_file_index;
-            std::int64_t f_off = g_file_offset, f_sz = g_file_size, p_sz = g_piece_size;
-
-            g_server->Get("/stream", [=](const httplib::Request&, httplib::Response& res) {
-                try {
-                    if (!std::filesystem::exists(file_path)) {
-                        res.status = 503; res.set_content("File not available yet", "text/plain"); return;
-                    }
-                    auto p = std::make_shared<TorrentContentProvider>(file_path, handle, f_off, f_sz, p_sz, f_idx);
-                    res.set_content_provider(f_sz, mime_val, [p](uint64_t off, uint64_t len, httplib::DataSink& sink) {
-                        return (*p)(off, len, sink);
-                        });
-                    res.set_header("Accept-Ranges", "bytes");
-                    res.set_header("ETag", etag_val);
-                    res.set_header("Cache-Control", "no-cache");
-                    add_cors(res);
-                }
-                catch (...) { res.status = 500; res.set_content("Internal Server Error", "text/plain"); }
-                });
-
-            g_server->Get("/status", [add_cors](const httplib::Request&, httplib::Response& res) {
-                try { res.set_content(build_status_json(), "application/json"); add_cors(res); }
-                catch (...) { res.status = 500; res.set_content(R"({"error":"internal error"})", "application/json"); }
-                });
-            g_server->Options(R"(.*)", [add_cors](const httplib::Request&, httplib::Response& res) {
-                add_cors(res); res.status = 204;
-                });
-
-            g_running.store(true, std::memory_order_release);
-            g_server_thread = std::thread([this_port = port]() {
-                try { g_server->listen("127.0.0.1", this_port); }
-                catch (...) {}
-                g_running.store(false, std::memory_order_release);
-                });
-
-            auto begin = std::chrono::steady_clock::now();
-            while (!g_server->is_running() && g_running.load(std::memory_order_acquire)) {
-                if (std::chrono::steady_clock::now() - begin > std::chrono::seconds(4)) {
-                    g_server->stop(); if (g_server_thread.joinable()) g_server_thread.join(); g_server.reset();
-                    g_running.store(false, std::memory_order_release);
-                    g_last_error = "Server start timed out"; return false;
-                }
-                std::this_thread::sleep_for(std::chrono::milliseconds(10));
-            }
-
-            char buf[128];
-            snprintf(buf, sizeof(buf), "http://127.0.0.1:%d/stream", port);
-            { std::lock_guard<std::mutex> lock(g_url_mutex); g_url_buffer = buf; out_url = g_url_buffer; }
-            return true;
+    void notify_piece_ready(int piece_idx) {
+        std::shared_ptr<StreamSession> s;
+        {
+            std::lock_guard<std::mutex> lk(g_stream_mutex);
+            s = g_stream;
         }
-        catch (const std::exception& e) {
-            g_last_error = std::string("start_server: ") + e.what(); return false;
-        }
-        catch (...) { g_last_error = "start_server unknown exception"; return false; }
-    }
-
-    void stop_server() {
-        try {
-            if (g_server && g_running.load(std::memory_order_acquire)) g_server->stop();
-            if (g_server_thread.joinable()) g_server_thread.join();
-            g_server.reset();
-
-            lt::torrent_handle h; int psize; std::int64_t foff, fsz;
-            {
-                std::lock_guard<std::mutex> lock(g_state_mutex);
-                h = g_handle; psize = g_piece_size; foff = g_file_offset; fsz = g_file_size;
-            }
-            if (h.is_valid() && psize > 0) {
-                int first = static_cast<int>(foff / psize), last = static_cast<int>((foff + fsz - 1) / psize);
-                for (int p = first; p <= last; ++p) h.piece_priority(lt::piece_index_t(p), lt::default_priority);
-            }
-            g_running.store(false, std::memory_order_release);
-            cache_clear();
-        }
-        catch (...) { STREAM_LOG("Exception in stop_server"); }
-    }
-
-    bool is_running() { return g_running.load(std::memory_order_acquire); }
-    const char* last_error() { std::lock_guard<std::mutex> lock(g_state_mutex); return g_last_error.c_str(); }
-    void reset_state() {
-        stop_server();
-        std::lock_guard<std::mutex> lock(g_state_mutex);
-        g_handle = lt::torrent_handle{}; g_file_index = -1; g_file_path.clear();
-        g_file_size = 0; g_file_offset = 0; g_piece_size = 0;
-        g_mime_type.clear(); g_etag.clear(); g_last_error.clear();
+        if (s) s->waiter.notify(piece_idx);
     }
 
 } // namespace cs_stream
 
+// ════════════════════════════════════════════════════════════════════════
+// Exported C API (helpers fuera de extern "C")
+// ════════════════════════════════════════════════════════════════════════
+static std::string  g_url_result;
+static std::mutex   g_url_mutex;
+
 extern "C" {
-    const char* start_stream_server_impl(lt::session* session, lt::torrent_handle* handle, int32_t file_index, int32_t port) {
-        static std::string url_result; static std::mutex result_mutex;
-        std::lock_guard<std::mutex> lock(result_mutex);
-        if (cs_stream::start_server(session, handle, file_index, port, url_result)) return url_result.c_str();
+
+    const char* start_stream_server_impl(lt::session* session,
+        lt::torrent_handle* handle,
+        int32_t file_index, int32_t port) {
+        std::lock_guard<std::mutex> lk(g_url_mutex);
+        if (cs_stream::start_server(session, handle, file_index, port, g_url_result))
+            return g_url_result.c_str();
         return nullptr;
     }
-    void stop_stream_server_impl() { cs_stream::stop_server(); }
-    uint8_t is_stream_server_running_impl() { return cs_stream::is_running() ? 1 : 0; }
-    void reset_stream_server_impl() { cs_stream::reset_state(); }
+
+    void        stop_stream_server_impl() { cs_stream::stop_server(); }
+    uint8_t     is_stream_server_running_impl() { return cs_stream::is_running() ? 1 : 0; }
+    void        reset_stream_server_impl() { cs_stream::reset_state(); }
     const char* get_last_stream_error_impl() { return cs_stream::last_error(); }
-}
+
+    void        notify_piece_ready_impl(int32_t piece_idx) {
+        cs_stream::notify_piece_ready(piece_idx);
+    }
+
+    // Streaming configuration (call before start_server)
+    void configure_streaming_impl(
+        int cache_limit_mb,
+        int min_readahead, int max_readahead,
+        int back_window,
+        int deadline_base_ms, int deadline_step_ms,
+        int window_update_throttle_ms,
+        int piece_poll_interval_ms,
+        int piece_poll_max_attempts,
+        int anchor_piece_poll_max_attempts,
+        int ensure_piece_max_retries,
+        int deadline_reemit_interval_ms,
+        int startup_buffer_pieces,
+        int tail_pieces,
+        uint8_t enable_tail_prefetch) {
+
+        cs_stream::StreamingConfig cfg;
+        cfg.cache_limit_mb = cache_limit_mb;
+        cfg.min_readahead = min_readahead;
+        cfg.max_readahead = max_readahead;
+        cfg.back_window = back_window;
+        cfg.deadline_base_ms = deadline_base_ms;
+        cfg.deadline_step_ms = deadline_step_ms;
+        cfg.window_update_throttle_ms = window_update_throttle_ms;
+        cfg.piece_poll_interval_ms = piece_poll_interval_ms;
+        cfg.piece_poll_max_attempts = piece_poll_max_attempts;
+        cfg.anchor_piece_poll_max_attempts = anchor_piece_poll_max_attempts;
+        cfg.ensure_piece_max_retries = ensure_piece_max_retries;
+        cfg.deadline_reemit_interval_ms = deadline_reemit_interval_ms;
+        cfg.startup_buffer_pieces = startup_buffer_pieces;
+        cfg.tail_pieces = tail_pieces;
+        cfg.enable_tail_prefetch = (enable_tail_prefetch != 0);
+        cs_stream::configure_streaming(cfg);
+    }
+} // extern "C"

@@ -7,16 +7,21 @@ using csdl.Enums;
 
 namespace csdl.Native;
 
+/// <summary>
+/// Contains P/Invoke declarations for the native 'csdl' library.
+/// </summary>
 internal static partial class NativeMethods
 {
     private const string LibraryName = "csdl";
 
+    // ── Callback delegate ─────────────────────────────────────────────────────
     /// <summary>
     /// Delegate representing the callback for session events.
     /// </summary>
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
     public delegate void SessionEventCallback(IntPtr alertPtr);
 
+    // ── Session management ────────────────────────────────────────────────────
     /// <summary>
     /// Creates a session, optionally using a provided settings pack.
     /// </summary>
@@ -33,6 +38,15 @@ internal static partial class NativeMethods
     public static partial void FreeSession(IntPtr sessionHandle);
 
     /// <summary>
+    /// Applies a settings pack to a session.
+    /// </summary>
+    /// <param name="sessionHandle">The session handle to apply the pack to</param>
+    /// <param name="settingsPack">The pack handle to apply</param>
+    [LibraryImport(LibraryName, EntryPoint = "apply_settings")]
+    public static partial void ApplySettingsPack(IntPtr sessionHandle, IntPtr settingsPack);
+
+    // ── Event callback management ─────────────────────────────────────────────
+    /// <summary>
     /// Sets the event callback for a session.
     /// </summary>
     /// <param name="sessionHandle">The handle for the session to add the callback to</param>
@@ -48,14 +62,7 @@ internal static partial class NativeMethods
     [LibraryImport(LibraryName, EntryPoint = "clear_event_callback")]
     public static partial void ClearEventCallback(IntPtr sessionHandle);
 
-    /// <summary>
-    /// Applies a settings pack to a session.
-    /// </summary>
-    /// <param name="sessionHandle">The session handle to apply the pack to</param>
-    /// <param name="settingsPack">The pack handle to apply</param>
-    [LibraryImport(LibraryName, EntryPoint = "apply_settings")]
-    public static partial void ApplySettingsPack(IntPtr sessionHandle, IntPtr settingsPack);
-
+    // ── Torrent management ────────────────────────────────────────────────────
     /// <summary>
     /// Create a torrent from a file on the local disk
     /// </summary>
@@ -259,6 +266,7 @@ internal static partial class NativeMethods
 
     #region Streaming Server
 
+    // ── Core streaming lifecycle ──────────────────────────────────────────────
     /// <summary>
     /// Starts an embedded HTTP streaming server for a specific file within a torrent.
     /// </summary>
@@ -288,25 +296,88 @@ internal static partial class NativeMethods
     public static partial bool IsStreamServerRunning();
 
     /// <summary>
-    /// Reinicia completamente el estado del servidor de streaming embebido.
-    /// Útil si el servidor queda en estado inconsistente por errores de red extremos.
+    /// Resets the internal state of the streaming server.
+    /// Useful if the server becomes unstable due to extreme network errors.
     /// </summary>
     [DllImport(LibraryName, EntryPoint = "reset_stream_server", CallingConvention = CallingConvention.Cdecl)]
     public static extern void ResetStreamServer();
+
+    /// <summary>
+    /// Retrieves the last error description from the streaming server.
+    /// The returned pointer is valid until the next stream operation.
+    /// </summary>
     [DllImport(LibraryName, EntryPoint = "get_last_stream_error", CallingConvention = CallingConvention.Cdecl)]
     public static extern IntPtr GetLastStreamError();
 
+    /// <summary>
+    /// Queries the piece length of the torrent.
+    /// </summary>
     [DllImport(LibraryName, EntryPoint = "get_piece_length", CallingConvention = CallingConvention.Cdecl)]
     public static extern int GetPieceLength(IntPtr torrentHandle);
 
-    // ── Seek inteligente ─────────────────────────────────────────────────────
+    // ── Seek helpers ───────────────────────────────────────────────────────────
+    /// <summary>
+    /// Checks whether the byte at <paramref name="bytePosition"/> within the given file
+    /// is available in the torrent's download cache.
+    /// </summary>
     [DllImport(LibraryName, EntryPoint = "is_byte_available_impl", CallingConvention = CallingConvention.Cdecl)]
     [return: MarshalAs(UnmanagedType.I1)]
     public static extern bool IsByteAvailable(IntPtr torrentHandle, int fileIndex, long bytePosition);
 
+    /// <summary>
+    /// Instructs the torrent engine to prioritise the range around
+    /// <paramref name="bytePosition"/> for immediate download.
+    /// </summary>
     [DllImport(LibraryName, EntryPoint = "prioritize_seek_range_impl", CallingConvention = CallingConvention.Cdecl)]
     [return: MarshalAs(UnmanagedType.I1)]
     public static extern bool PrioritizeSeekRange(IntPtr torrentHandle, int fileIndex, long bytePosition, long pieceSize);
-    #endregion
 
+    // ── Streaming configuration ───────────────────────────────────────────────
+    /// <summary>
+    /// Configures the embedded streaming server. Must be called before
+    /// <see cref="StartStreamServer"/>.
+    /// </summary>
+    /// <param name="cacheLimitMb">Maximum RAM cache size for pieces, in MiB.</param>
+    /// <param name="minReadahead">Minimum number of pieces to keep ahead of playback.</param>
+    /// <param name="maxReadahead">Maximum number of pieces to keep ahead of playback.</param>
+    /// <param name="backWindow">Number of pieces to keep behind the playback head.</param>
+    /// <param name="deadlineBaseMs">Base deadline for the current piece, in milliseconds.</param>
+    /// <param name="deadlineStepMs">Additional deadline step for each subsequent piece.</param>
+    /// <param name="windowUpdateThrottleMs">Minimum interval between window updates.</param>
+    /// <param name="piecePollIntervalMs">Polling interval while waiting for a piece.</param>
+    /// <param name="piecePollMaxAttempts">Maximum poll attempts for a normal piece.</param>
+    /// <param name="anchorPiecePollMaxAttempts">Maximum poll attempts for an anchor piece.</param>
+    /// <param name="ensurePieceMaxRetries">Consecutive piece failures before aborting the stream.</param>
+    /// <param name="deadlineReemitIntervalMs">Minimum interval between deadline re‑emissions.</param>
+    /// <param name="startupBufferPieces">Number of pieces to buffer before switching to streaming mode.</param>
+    /// <param name="tailPieces">Number of tail pieces to keep as anchors.</param>
+    /// <param name="enableTailPrefetch">
+    /// Whether to actively prefetch tail pieces during bootstrap.
+    /// <c>true</c> (recommended) helps with quick seeks and metadata retrieval.
+    /// </param>
+    [LibraryImport(LibraryName, EntryPoint = "configure_stream_server")]
+    public static partial void ConfigureStreamServer(
+        int cacheLimitMb,
+        int minReadahead, int maxReadahead,
+        int backWindow,
+        int deadlineBaseMs, int deadlineStepMs,
+        int windowUpdateThrottleMs,
+        int piecePollIntervalMs,
+        int piecePollMaxAttempts,
+        int anchorPiecePollMaxAttempts,
+        int ensurePieceMaxRetries,
+        int deadlineReemitIntervalMs,
+        int startupBufferPieces,
+        int tailPieces,
+        [MarshalAs(UnmanagedType.U1)] bool enableTailPrefetch);
+
+    /// <summary>
+    /// Creates a native settings pack pre‑configured for streaming.
+    /// The returned handle must be freed with <see cref="FreeSettingsPack"/>.
+    /// </summary>
+    /// <returns>A handle to the native settings pack.</returns>
+    [LibraryImport(LibraryName, EntryPoint = "create_streaming_settings")]
+    public static partial IntPtr CreateStreamingSettingsPack();
+
+    #endregion
 }

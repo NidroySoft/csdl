@@ -132,4 +132,13 @@ public class SettingsPack
 
         return pack;
     }
+
+    /// <summary>
+    /// Creates a native settings pack pre‑configured for streaming.
+    /// The returned handle must be freed by the caller, e.g. via <see cref="NativeMethods.FreeSettingsPack"/>.
+    /// </summary>
+    public static IntPtr CreateStreamingNativePack()
+    {
+        return NativeMethods.CreateStreamingSettingsPack();
+    }
 }

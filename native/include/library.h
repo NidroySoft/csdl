@@ -19,8 +19,7 @@ extern "C" {
     // ── session control ───────────────────────────────────────────────────────
     CSDL_EXPORT lt::session* create_session(lt::settings_pack* pack);
     CSDL_EXPORT void         destroy_session(lt::session* session);
-
-    CSDL_EXPORT void apply_settings(lt::session* session, lt::settings_pack* settings);
+    CSDL_EXPORT void         apply_settings(lt::session* session, lt::settings_pack* settings);
 
     // ── torrent control ───────────────────────────────────────────────────────
     CSDL_EXPORT lt::torrent_info* create_torrent_file(const char* file_path);
@@ -32,7 +31,7 @@ extern "C" {
 
     // ── torrent info ──────────────────────────────────────────────────────────
     CSDL_EXPORT torrent_metadata* get_torrent_info(lt::torrent_info* torrent);
-    CSDL_EXPORT int32_t get_piece_length(lt::torrent_handle* torrent);
+    CSDL_EXPORT int32_t           get_piece_length(lt::torrent_handle* torrent);
     CSDL_EXPORT void              destroy_torrent_info(torrent_metadata* info);
 
     // ── file listing ──────────────────────────────────────────────────────────
@@ -59,11 +58,31 @@ extern "C" {
     CSDL_EXPORT const char* start_stream_server(lt::session* session, lt::torrent_handle* torrent, int32_t file_index, int32_t port);
     CSDL_EXPORT void        stop_stream_server();
     CSDL_EXPORT uint8_t     is_stream_server_running();
-    CSDL_EXPORT void reset_stream_server();
+    CSDL_EXPORT void        reset_stream_server();
     CSDL_EXPORT const char* get_last_stream_error();
-    CSDL_EXPORT uint8_t have_piece(lt::torrent_handle* torrent, int32_t piece_index);
-    CSDL_EXPORT uint8_t is_byte_available_impl(lt::torrent_handle* torrent, int32_t file_index, int64_t byte_position);
-    CSDL_EXPORT uint8_t prioritize_seek_range_impl(lt::torrent_handle* torrent, int32_t file_index, int64_t byte_position, int64_t piece_size);
+    CSDL_EXPORT uint8_t     have_piece(lt::torrent_handle* torrent, int32_t piece_index);
+    CSDL_EXPORT uint8_t     is_byte_available_impl(lt::torrent_handle* torrent, int32_t file_index, int64_t byte_position);
+    CSDL_EXPORT uint8_t     prioritize_seek_range_impl(lt::torrent_handle* torrent, int32_t file_index, int64_t byte_position, int64_t piece_size);
+
+    // ── streaming configuration (applied before start_stream_server) ──────────
+    CSDL_EXPORT void configure_stream_server(
+        int cache_limit_mb,
+        int min_readahead, int max_readahead,
+        int back_window,
+        int deadline_base_ms, int deadline_step_ms,
+        int window_update_throttle_ms,
+        int piece_poll_interval_ms,
+        int piece_poll_max_attempts,
+        int anchor_piece_poll_max_attempts,
+        int ensure_piece_max_retries,
+        int deadline_reemit_interval_ms,
+        int startup_buffer_pieces,
+        int tail_pieces,
+        uint8_t enable_tail_prefetch
+    );
+
+    // ── settings pack for streaming (creates an optimized settings pack) ──────
+    CSDL_EXPORT lt::settings_pack* create_streaming_settings();
 
 #ifdef __cplusplus
 }
