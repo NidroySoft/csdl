@@ -247,4 +247,15 @@ public class TorrentManager
         return false;
     }
 
+    /// <summary>
+    /// Inicia el servidor de streaming para el archivo más grande del torrent
+    /// (normalmente el vídeo). Usa el puerto 55201.
+    /// </summary>
+    /// <returns>La URL de streaming.</returns>
+    public string StartStreamingLargestFile(int port = 55201)
+    {
+        var largest = Info.Files.OrderByDescending(f => f.FileSize).First();
+        return StartStreaming(largest.Index, port);
+    }
+
 }

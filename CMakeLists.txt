@@ -1,12 +1,12 @@
 cmake_minimum_required(VERSION 3.21)
 include(GenerateExportHeader)
 
-project(cs_native LANGUAGES CXX VERSION 2.4.0)
+project(cs_native LANGUAGES CXX VERSION 2.4.5)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
-option(BUILD_TESTS "Build internal test executables" OFF)
+option(BUILD_TESTS "Build internal test executables" ON)
 
 # ── Platform-specific adjustments ──────────────────────────────────────
 if(WIN32)
@@ -78,7 +78,7 @@ target_link_libraries(csdl PRIVATE
 )
 
 # ── Executable de prueba ───────────────────────────────────────────────
-if(BUILD_TESTS)
+
     add_executable(test_streaming
         native/test/test_streaming.cpp
         ${COMMON_SOURCES}
@@ -98,7 +98,6 @@ if(BUILD_TESTS)
     if(WIN32)
         target_link_libraries(test_streaming PRIVATE ${SYS_LIBS})
     endif()
-endif()
 # ── Windows system libraries ───────────────────────────────────────────
 if(WIN32)
     set(SYS_LIBS ws2_32 crypt32 iphlpapi bcrypt advapi32 user32 shell32

@@ -235,6 +235,8 @@ namespace cs_stream {
         std::atomic<int64_t> last_range_ts = 0;
 
         std::atomic<StreamState> state{ StreamState::Bootstrap };
+        std::string file_name;
+        std::string file_path;
 
         // Configuration snapshot (captured at start)
         StreamingConfig cfg;
@@ -724,48 +726,169 @@ namespace cs_stream {
     static std::string build_status_json(const std::shared_ptr<StreamSession>& sess) {
         if (!sess || !sess->handle.is_valid())
             return R"({"error":"no active session"})";
+
+        std::shared_ptr<StreamSession> s;
+        {
+            std::lock_guard<std::mutex> lk(g_stream_mutex);
+            s = g_stream;
+        }
+        if (!s) return R"({"error":"no active stream"})";
+
         try {
-            lt::torrent_status st = sess->handle.status(
+            lt::torrent_status st = s->handle.status(
                 lt::torrent_handle::query_pieces |
                 lt::torrent_handle::query_accurate_download_counters);
 
-            auto ti = st.torrent_file.lock();
+            auto ti = st.torrent_file.lock();   // puede ser null si no hay metadatos
 
             std::ostringstream j;
-            j << "{\n"
-                << "  \"progress\":" << st.progress << ",\n"
-                << "  \"download_rate\":" << st.download_payload_rate << ",\n"
-                << "  \"upload_rate\":" << st.upload_payload_rate << ",\n"
-                << "  \"num_peers\":" << st.num_peers << ",\n"
-                << "  \"num_seeds\":" << st.num_seeds << ",\n"
-                << "  \"is_finished\":" << (st.is_finished ? "true" : "false") << ",\n";
+            j << "{\n";
 
-            if (ti) {
-                const auto& files = ti->files();
-                lt::file_index_t fidx(sess->file_index);
-                std::vector<int64_t> fprog;
-                sess->handle.file_progress(fprog);
-                int64_t file_down = (sess->file_index < static_cast<int>(fprog.size()))
-                    ? fprog[sess->file_index] : 0;
+            // ── Básicos de la sesión ─────────────────────────────────
+            j << "  \"state\":\""
+                << (s->state.load() == StreamState::Bootstrap ? "bootstrap" : "streaming")
+                << "\",\n";
+            j << "  \"read_head\":" << s->read_head.load() << ",\n";
+            j << "  \"last_window_start\":" << s->last_window_start << ",\n";
+            j << "  \"last_window_end\":" << s->last_window_end << ",\n";
+            j << "  \"is_running\":" << (g_running.load() ? "true" : "false") << ",\n";
 
-                j << ",\n  \"file\": {\n"
-                    << "    \"index\":" << sess->file_index << ",\n"
-                    << "    \"name\":\"" << escape_json(std::string(files.file_name(fidx))) << "\",\n"
-                    << "    \"size\":" << sess->file_size << ",\n"
-                    << "    \"downloaded\":" << file_down << ",\n"
-                    << "    \"progress\":" << (sess->file_size > 0 ? static_cast<double>(file_down) / sess->file_size : 0.0) << ",\n"
-                    << "    \"first_piece\":" << sess->first_piece << ",\n"
-                    << "    \"last_piece\":" << sess->last_piece << "\n"
-                    << "  }";
+            // ── Configuración ────────────────────────────────────────
+            const StreamingConfig& cfg = s->cfg;
+            j << "  \"config\": {\n"
+                << "    \"cache_limit_mb\":" << cfg.cache_limit_mb << ",\n"
+                << "    \"min_readahead\":" << cfg.min_readahead << ",\n"
+                << "    \"max_readahead\":" << cfg.max_readahead << ",\n"
+                << "    \"back_window\":" << cfg.back_window << ",\n"
+                << "    \"deadline_base_ms\":" << cfg.deadline_base_ms << ",\n"
+                << "    \"deadline_step_ms\":" << cfg.deadline_step_ms << ",\n"
+                << "    \"window_update_throttle_ms\":" << cfg.window_update_throttle_ms << ",\n"
+                << "    \"piece_poll_interval_ms\":" << cfg.piece_poll_interval_ms << ",\n"
+                << "    \"piece_poll_max_attempts\":" << cfg.piece_poll_max_attempts << ",\n"
+                << "    \"anchor_piece_poll_max_attempts\":" << cfg.anchor_piece_poll_max_attempts << ",\n"
+                << "    \"ensure_piece_max_retries\":" << cfg.ensure_piece_max_retries << ",\n"
+                << "    \"deadline_reemit_interval_ms\":" << cfg.deadline_reemit_interval_ms << ",\n"
+                << "    \"startup_buffer_pieces\":" << cfg.startup_buffer_pieces << ",\n"
+                << "    \"tail_pieces\":" << cfg.tail_pieces << ",\n"
+                << "    \"enable_tail_prefetch\":" << (cfg.enable_tail_prefetch ? "true" : "false") << "\n"
+                << "  },\n";
+
+            // ── Caché ─────────────────────────────────────────────────
+            {
+                j << "  \"cache\": {\n";
+                j << "    \"first_piece_cached\":" << (s->cache->contains(s->first_piece) ? "true" : "false") << ",\n";
+                j << "    \"last_piece_cached\":" << (s->cache->contains(s->last_piece) ? "true" : "false") << ",\n";
+
+                int cached_in_window = 0;
+                int window_size = 0;
+                if (s->last_window_start != -1 && s->last_window_end != -1 &&
+                    s->last_window_end >= s->last_window_start) {
+                    window_size = s->last_window_end - s->last_window_start + 1;
+                    for (int p = s->last_window_start; p <= s->last_window_end; ++p)
+                        if (s->cache->contains(p)) cached_in_window++;
+                }
+                j << "    \"cached_in_window\":" << cached_in_window << ",\n";
+                j << "    \"window_size\":" << window_size << "\n";
+                j << "  },\n";
             }
-            j << "\n}";
+
+            // ── Piezas en vuelo ──────────────────────────────────────
+            {
+                std::lock_guard<std::mutex> lk(s->inflight_mu);
+                j << "  \"inflight\": {\n";
+                j << "    \"inflight_count\":" << s->inflight_reads.size() << ",\n";
+                j << "    \"pending_count\":" << s->pending_reads.size() << ",\n";
+                j << "    \"inflight_pieces\": [";
+                bool first = true;
+                for (int p : s->inflight_reads) {
+                    if (!first) j << ",";
+                    j << p;
+                    first = false;
+                }
+                j << "],\n";
+                j << "    \"pending_pieces\": [";
+                first = true;
+                for (int p : s->pending_reads) {
+                    if (!first) j << ",";
+                    j << p;
+                    first = false;
+                }
+                j << "]\n";
+                j << "  },\n";
+            }
+
+            // ── Torrent ────────────────────────────────────────────────
+            j << "  \"torrent\": {\n"
+                << "    \"progress\":" << st.progress << ",\n"
+                << "    \"download_rate\":" << st.download_payload_rate << ",\n"
+                << "    \"upload_rate\":" << st.upload_payload_rate << ",\n"
+                << "    \"num_peers\":" << st.num_peers << ",\n"
+                << "    \"num_seeds\":" << st.num_seeds << ",\n"
+                << "    \"is_finished\":" << (st.is_finished ? "true" : "false") << ",\n"
+                << "    \"is_seeding\":" << (st.is_seeding ? "true" : "false") << ",\n"
+                << "    \"total_downloaded\":" << st.total_payload_download << ",\n"
+                << "    \"total_uploaded\":" << st.total_payload_upload << ",\n"
+                << "    \"state_flags\":\"" << st.state << "\"\n"
+                << "  },\n";
+
+            // ── Archivo servido (siempre presente) ─────────────────────
+            {
+                j << "  \"file\": {\n"
+                    << "    \"index\":" << s->file_index << ",\n"
+                    << "    \"name\":\"" << escape_json(s->file_name.empty() ? "unknown" : s->file_name) << "\",\n"
+                    << "    \"path\":\"" << escape_json(s->file_path.empty() ? "unknown" : s->file_path) << "\",\n"
+                    << "    \"size\":" << s->file_size << ",\n";
+
+                // Progreso exacto del archivo (si es posible)
+                if (ti) {
+                    std::vector<int64_t> fprog;
+                    s->handle.file_progress(fprog);
+                    int64_t file_down = (s->file_index < static_cast<int>(fprog.size()))
+                        ? fprog[s->file_index] : 0;
+                    j << "    \"downloaded\":" << file_down << ",\n";
+                    j << "    \"progress\":" << (s->file_size > 0 ? static_cast<double>(file_down) / s->file_size : 0.0) << ",\n";
+                }
+                else {
+                    // Estimación basada en el progreso global del torrent
+                    int64_t approx_down = static_cast<int64_t>(st.progress * s->file_size);
+                    j << "    \"downloaded\":" << approx_down << ",\n";
+                    j << "    \"progress\":" << (s->file_size > 0 ? st.progress : 0.0) << ",\n";
+                }
+                j << "    \"first_piece\":" << s->first_piece << ",\n"
+                    << "    \"last_piece\":" << s->last_piece << "\n"
+                    << "  },\n";
+            }
+
+            // ── Anclas ──────────────────────────────────────────────────
+            j << "  \"anchors\": {\n"
+                << "    \"first_piece\":" << s->first_piece << ",\n"
+                << "    \"first_piece_available\":"
+                << (piece_available(s->handle, s->first_piece) ? "true" : "false") << ",\n"
+                << "    \"last_pieces\": [";
+            {
+                bool first_tail = true;
+                for (int i = 0; i < s->cfg.tail_pieces; ++i) {
+                    int p = s->last_piece - i;
+                    if (p <= s->first_piece) break;
+                    if (!first_tail) j << ",";
+                    j << "{"
+                        << "\"piece\":" << p
+                        << ",\"available\":" << (piece_available(s->handle, p) ? "true" : "false")
+                        << ",\"cached\":" << (s->cache->contains(p) ? "true" : "false")
+                        << "}";
+                    first_tail = false;
+                }
+            }
+            j << "]\n"
+                << "  }\n";
+
+            j << "}";
             return j.str();
         }
         catch (...) {
             return R"({"error":"internal error"})";
         }
     }
-
     // ════════════════════════════════════════════════════════════════════════
     // Public API
     // ════════════════════════════════════════════════════════════════════════
@@ -815,6 +938,7 @@ namespace cs_stream {
             sp.set_bool(lt::settings_pack::enable_upnp, true);
             sp.set_bool(lt::settings_pack::enable_natpmp, true);
 
+
             session->apply_settings(sp);
             STREAM_LOG("Streaming session configured");
         }
@@ -844,7 +968,8 @@ namespace cs_stream {
         s->mime = detect_mime(files.file_path(fidx));
         s->state.store(StreamState::Bootstrap, std::memory_order_release);
         s->cfg = get_config();   // snapshot current configuration
-
+        s->file_name = std::string(files.file_name(fidx));
+        s->file_path = std::string(files.file_path(fidx));
         // Create cache with configured limit
         s->cache = std::make_unique<PieceCache>(s->cfg.cache_limit_mb);
 

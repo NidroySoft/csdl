@@ -1,183 +1,343 @@
-
-
-```markdown
 # csdl
-Providing libtorrent through a C++ library for use in .NET on Windows, Linux, macOS and Android.
 
-## Usage
-[![Latest Nuget](https://img.shields.io/nuget/v/csdl.Native?label=csdl&logo=nuget)](https://nuget.org/packages/csdl)
+Cross-platform .NET wrapper for [libtorrent](https://libtorrent.org) with an embedded HTTP streaming server.  
+Designed for high-performance torrent downloads and low-latency media playback on Windows, Linux, macOS and Android.
 
-Add `csdl` to the project via [NuGet](https://nuget.org/packages/csdl) and create a single `TorrentClient` instance.
-This will usually be `static` (or singleton if using a dependency container), and a `TorrentClientConfig` can be passed in the constructor to configure the client.
+[![Latest Nuget](https://img.shields.io/nuget/v/csdl?label=csdl&logo=nuget)](https://nuget.org/packages/csdl)
+[![Android Nuget](https://img.shields.io/nuget/v/csdl.Native.android?label=csdl.Native.android&logo=nuget)](https://nuget.org/packages/csdl.Native.android)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue)](license.md)
 
-```csharp
-// create a new TorrentClient instance, optionally passing in the configuration
-var options = new TorrentClientConfig
-{
-    ForceEncryption = true,
-    MaxConnections = 500
-};
+---
 
-using var client = new TorrentClient(options);
+## Table of Contents
 
-// bonus: there is also an event handler that can be subscribed to if more information is wanted.
-client.AlertRaised += (sender, args) =>
-{
-    // args can be checked against all classes in the csdl.Alerts namespace for more properties.
-    Console.WriteLine(args.Message);
-};
+- [Installation](#installation)
+- [Quick Start](#quick-start)
+- [Streaming](#streaming)
+  - [One-line setup](#one-line-setup)
+  - [Manual setup](#manual-setup)
+  - [Startup order](#startup-order)
+  - [Monitoring with /status](#monitoring-with-status)
+  - [Seeking](#seeking)
+  - [Configuration](#configuration)
+- [Torrent management](#torrent-management)
+- [Events](#events)
+- [Supported platforms](#supported-platforms)
+- [License](#license)
+
+---
+
+## Installation
+
+```bash
+dotnet add package csdl
 ```
 
-.torrent files can be parsed either by passing in a file path or a byte array containing the file contents to the `TorrentInfo` class, and the instance will be populated accordingly.
-Some metadata can be accessed from the `TorrentInfo` instance, such as the name of the torrent and a list of files contained within it.
+For Android, also add the platform native package:
+
+```bash
+dotnet add package csdl.Native.android
+```
+
+---
+
+## Quick Start
 
 ```csharp
-var filePath = "path/to/torrent/file.torrent";
-var torrentInfo = new TorrentInfo(filePath);
+using var client = new TorrentClient();
 
-// get the name and list of files
-Console.WriteLine($"Name: {torrentInfo.Name}");
-Console.WriteLine("Files:");
+var torrent = new TorrentInfo("path/to/file.torrent");
+var manager = client.AttachTorrent(torrent, "./downloads");
 
-foreach (var file in torrentInfo.Files)
+manager.Start();
+
+// Poll until finished
+while (manager.GetCurrentStatus().State is not (TorrentState.Finished or TorrentState.Seeding))
+    await Task.Delay(1000);
+
+manager.Stop();
+client.DetachTorrent(manager);
+```
+
+---
+
+## Streaming
+
+The embedded HTTP server serves any file inside a torrent while it is still downloading.  
+It manages its own piece scheduler, RAM cache, and playback window — no configuration required to get started.
+
+### One-line setup
+
+`CreateForStreaming` builds a `TorrentClient` with all native settings pre-tuned for streaming.  
+`QuickStream` attaches the torrent, selects the largest file, starts the server and begins the download in a single call.
+
+```csharp
+using var client = TorrentClient.CreateForStreaming("./downloads");
+
+var torrent = new TorrentInfo("big-buck-bunny.torrent");
+string url = client.QuickStream(torrent);
+
+// Open url in VLC, LibVLC, or any HTTP-capable media player
+Console.WriteLine(url);
+Console.ReadLine();
+```
+
+`QuickStream` accepts optional `port` and `savePath` parameters:
+
+```csharp
+string url = client.QuickStream(torrent, port: 8080, savePath: "./movies");
+```
+
+### Manual setup
+
+Use the lower-level API when you need to control file priorities, monitor progress, or stream a specific file index.
+
+```csharp
+// 1. Create a streaming-optimised client
+using var client = TorrentClient.CreateForStreaming("./downloads", new StreamingConfiguration
 {
-    Console.WriteLine($"- {file.Path} ({file.Size} bytes)");
+    CacheLimitMb       = 512,
+    EnableTailPrefetch = true
+});
+
+// 2. Attach torrent and set file priorities
+var torrent = new TorrentInfo("film.torrent");
+var manager = client.AttachTorrent(torrent, "./downloads");
+
+int videoIndex = manager.Files
+    .OrderByDescending(f => f.Info.FileSize)
+    .First().Info.Index;
+
+foreach (var f in manager.Files)
+    f.Priority = f.Info.Index == videoIndex
+        ? FileDownloadPriority.High
+        : FileDownloadPriority.DoNotDownload;
+
+// 3. Hand alert ownership to the native streaming engine
+client.ClearManagedAlertCallback();
+
+// 4. Start the streaming server
+string url = manager.StartStreaming(videoIndex, port: 55201);
+
+// 5. Start the download
+manager.Start();
+
+Console.WriteLine($"Streaming at: {url}");
+Console.ReadLine();
+
+manager.StopStreaming();
+manager.Stop();
+```
+
+### Startup order
+
+> ⚠️ This order is mandatory when using the low-level API. `QuickStream` enforces it automatically.
+
+| Step | Call |
+|------|------|
+| 1 | `AttachTorrent` |
+| 2 | `ClearManagedAlertCallback` |
+| 3 | `StartStreaming` |
+| 4 | `manager.Start()` |
+
+`ClearManagedAlertCallback` gives the native alert pump exclusive ownership of `pop_alerts`.  
+If the managed callback remains active, it competes with the streaming engine for piece notifications and the server stalls.
+
+### Monitoring with /status
+
+The embedded server exposes a `/status` endpoint that returns a live JSON snapshot of the engine state.  
+Use it to build loading indicators or debug monitors without calling into libtorrent from the managed side.
+
+**Example response:**
+
+```json
+{
+  "state": "streaming",
+  "read_head": 42,
+  "last_window_start": 36,
+  "last_window_end": 234,
+  "is_running": true,
+  "cache": {
+    "first_piece_cached": true,
+    "last_piece_cached": true,
+    "cached_in_window": 18,
+    "window_size": 199
+  },
+  "inflight": {
+    "inflight_count": 3,
+    "inflight_pieces": [43, 44, 1053]
+  },
+  "torrent": {
+    "progress": 0.35,
+    "download_rate": 1250000,
+    "num_peers": 45,
+    "num_seeds": 12,
+    "is_finished": false
+  },
+  "file": {
+    "index": 0,
+    "name": "Big Buck Bunny.mp4",
+    "size": 276134946,
+    "downloaded": 96647231,
+    "progress": 0.35,
+    "first_piece": 0,
+    "last_piece": 1053
+  }
 }
 ```
 
-After parsing a torrent file, it can be "attached" to the client to start downloading the files. Note this method will not start a download, but will prepare the client to download the files when `Start` is called.
-This method also has an overload allowing a custom save path to be specified. If not, the default save path will be used (`client.DefaultDownloadPath`).
+**Polling /status from C#:**
 
 ```csharp
-// this will be saved to DefaultDownloadPath.
-var torrentManager = client.AttachTorrent(torrentInfo);
+using var http = new HttpClient();
 
-// the metadata can still be accessed but files have additional properties including their final destination and their download priority, which can be changed.
-torrentManager.Files[0].Priority = TorrentFilePriority.DoNotDownload;
-
-// after setting priorities, the download can begin (or resume if the torrent was previously started)
-torrentManager.Start();
-
-// if we want a progress update, we can request one
-var progress = torrentManager.GetCurrentStatus();
-
-if (progress.State == TorrentState.Finished)
+// Wait until the engine has left Bootstrap (file.progress >= 2%)
+while (true)
 {
-    torrentManager.Stop();
+    await Task.Delay(500);
+    string json = await http.GetStringAsync($"http://127.0.0.1:{port}/status");
+    using var doc = JsonDocument.Parse(json);
+    double fileProgress = doc.RootElement
+        .GetProperty("file").GetProperty("progress").GetDouble();
 
-    // when we want to "dispose" the manager, we can detach it from the client
-    client.DetachTorrent(torrentManager);
+    if (fileProgress >= 0.02) break;
 }
+
+// Safe to open in player now
 ```
 
-If we want to wait for the download to complete, a timer and a `TaskCompletionSource` can be used to await the completion of the download.
+> **Tip:** do not call `IsByteAvailable` in a tight loop while streaming is active —  
+> it calls `query_pieces` internally which interferes with the native alert pump.  
+> Use `/status` instead.
+
+### Seeking
+
+When the user scrubs to a new position, tell the engine to prioritise that area before resuming playback:
 
 ```csharp
-async Task PerformDownload(TorrentClient client, TorrentInfo info, string savePath = null)
-{
-    var torrentTransfer = new TaskCompletionSource();
-    var torrentManager = client.AttachTorrent(info, savePath);
+long targetByte = (long)(sliderValue * file.Info.FileSize);
 
-    torrentManager.Start();
-
-    using (new Timer(PerformProgressCheck, null, TimeSpan.Zero, TimeSpan.FromSeconds(1)))
-    {
-        await torrentTransfer.Task;
-    }
-
-    // at this point, the torrentManager has either finished downloading or seeding, and the poll has been stopped.
-
-    client.DetachTorrent(torrentManager);
-    return;
-
-    // this function polls the progress (makes a call to libtorrent) every second to check if the torrent has finished downloading
-    void PerformProgressCheck(object state)
-    {
-        if (torrentManager.GetCurrentStatus().State is TorrentState.Seeding or TorrentState.Finished)
-        {
-            torrentTransfer.SetResult();
-        }
-    }
-}
-```
-
-## Streaming & Seek
-
-`csdl` includes an embedded HTTP server that can serve any file inside a torrent directly to media players like VLC or LibVLCSharp.  
-The server is automatically tuned for low‑latency streaming, using sparse storage, aggressive peer timeouts, and intelligent piece deadlines.
-
-### Starting the streaming server
-
-```csharp
-// Attach a torrent (you may already have it)
-var manager = client.AttachTorrent(torrentInfo);
-
-// Start streaming the first file on port 0 (auto‑assign)
-string url = manager.StartStreaming(fileIndex: 0, port: 0);
-
-Console.WriteLine($"Stream available at: {url}");
-
-// Open the URL in any HTTP‑capable media player.
-```
-
-- The returned URL already contains the `/stream` route (e.g. `http://127.0.0.1:55201/stream`).
-- An additional `/status` endpoint returns a JSON object with download progress, peer counts, and piece availability.
-
-### Intelligent seeking
-
-When a user skips to a new position, the torrent engine needs to fetch the corresponding pieces before playback can continue.  
-`csdl` exposes two low‑level helpers that allow you to build a seamless seek experience:
-
-- **`IsByteAvailable(int fileIndex, long bytePosition)`** – checks whether the piece containing a specific byte has already been downloaded.
-- **`PrioritizeSeekRange(int fileIndex, long bytePosition)`** – tells the download engine to focus all bandwidth on the pieces that cover the requested byte.
-
-A typical seek flow from the UI layer looks like this:
-
-```csharp
-// User drags the progress bar to a new position
-long targetByte = (long)(sliderValue * fileSizeInBytes);
-
-// 1. Pause playback and tell the engine to prioritise the new point
 player.Pause();
 manager.PrioritizeSeekRange(fileIndex, targetByte);
 
-// 2. Wait until the required piece is available (with a timeout)
 bool ready = await manager.WaitForByteAvailableAsync(
     fileIndex, targetByte, TimeSpan.FromSeconds(10));
 
-if (ready)
-{
-    // 3. Seek the player and resume
-    player.Seek(TimeSpan.FromSeconds(targetByte / byteRate));
-    player.Play();
-}
-else
-{
-    // Inform the user and resume from the previous position
-    player.Play();
-}
+player.Seek(targetByte);
+player.Play();
 ```
 
-### Advanced configuration
+| Method | Description |
+|--------|-------------|
+| `IsByteAvailable(fileIndex, bytePosition)` | Returns true if the piece containing the byte is in cache. |
+| `PrioritizeSeekRange(fileIndex, bytePosition)` | Shifts the download window to focus on the seek target. |
+| `WaitForByteAvailableAsync(fileIndex, bytePosition, timeout)` | Waits asynchronously until the byte is available or the timeout expires. |
 
-`csdl` provides a built‑in `SettingsPack` factory for streaming‑optimised defaults. You can use it directly or modify it before creating the `TorrentClient`.
+### Configuration
+
+Pass a `StreamingConfiguration` to `CreateForStreaming` or `ConfigureStreaming` to tune the engine.  
+All parameters have production-ready defaults — only adjust what you need.
 
 ```csharp
-var pack = new SettingsPack();
-pack.Set("alert_mask", (int)AlertCategories.All);
-
-// Apply streaming‑tuned settings
-var streamingPack = NativeMethods.CreateStreamingSettings();  // returns an IntPtr
-var client = new TorrentClient(new TorrentClientConfig
+var config = new StreamingConfiguration
 {
-    // ...
-});
+    CacheLimitMb               = 1024,  // RAM cache size in MB (default: 256)
+    EnableTailPrefetch         = true,  // Pre-fetch last pieces for instant duration detection
+    StartupBufferPieces        = 10,    // Pieces to buffer before entering streaming mode
+    MinReadahead               = 4,     // Minimum readahead window (pieces)
+    MaxReadahead               = 200,   // Maximum readahead window (pieces)
+    PiecePollMaxAttempts       = 300,   // Max retries waiting for a piece
+    DeadlineBaseMs             = 1000,  // Base urgency deadline (ms)
+    DeadlineStepMs             = 500,   // Per-piece deadline increment (ms)
+};
+
+using var client = TorrentClient.CreateForStreaming("./downloads", config);
 ```
 
-> ⚠️ `NativeMethods.CreateStreamingSettings()` is a low‑level binding. In most cases the default `TorrentClient` constructor already applies sensible streaming defaults.
+`ConfigureStreaming` can also be called on an existing client **before** `StartStreaming`:
 
-## Supported Systems
+```csharp
+client.ConfigureStreaming(new StreamingConfiguration { CacheLimitMb = 512 });
+```
 
-The native libraries, `csdl.Native`, are currently built for Windows, macOS and Linux for both x64 and arm64 architectures.
+---
 
-Android support is also provided by an optional package, [csdl.Native.android](https://nuget.org/packages/csdl.Native.android) which can be installed alongside `csdl` to extend platform compatibility to Android 5.0+ devices with `x86_64`, `armeabi-v7a` and `arm64-v8a` ABIs.
+## Torrent management
+
+```csharp
+// Attach with a custom save path
+var manager = client.AttachTorrent(torrent, "./downloads/movies");
+
+// File-level priority control
+foreach (var file in manager.Files)
+    file.Priority = FileDownloadPriority.DoNotDownload;
+
+manager.Files[0].Priority = FileDownloadPriority.High;
+
+// Status polling
+var status = manager.GetCurrentStatus();
+Console.WriteLine($"{status.Progress * 100:F1}% at {status.DownloadRate / 1024} KB/s");
+
+// Re-announce to all trackers immediately
+manager.ReannounceAllTrackers(TimeSpan.Zero, force: true);
+
+// Stop and detach
+manager.Stop();
+client.DetachTorrent(manager);
+```
+
+### TorrentManagerFile
+
+Each entry in `manager.Files` exposes:
+
+| Member | Type | Description |
+|--------|------|-------------|
+| `Info` | `TorrentFileInfo` | File metadata from the .torrent (index, size, path, offset) |
+| `Path` | `string` | Fully resolved path on disk |
+| `Priority` | `FileDownloadPriority` | Get or set the download priority |
+
+---
+
+## Events
+
+Subscribe to `AlertRaised` to receive status, peer, and performance notifications.
+
+> **Note:** `AlertRaised` stops firing after `ClearManagedAlertCallback()` is called.  
+> Restore it with `UpdateSettings` or by creating a new session if you need events during streaming.
+
+```csharp
+client.AlertRaised += (_, alert) =>
+{
+    switch (alert)
+    {
+        case TorrentStatusAlert status:
+            Console.WriteLine($"State changed: {status.NewState}");
+            break;
+        case PeerAlert peer:
+            Console.WriteLine($"Peer {peer.Type}: {peer.Address}");
+            break;
+        case PerformanceWarningAlert perf:
+            Console.WriteLine($"Performance warning: {perf.WarningType}");
+            break;
+    }
+};
+```
+
+Set `client.IncludeUnmappedEvents = true` to also receive generic `SessionAlert` objects for alert types that have no dedicated managed type.
+
+---
+
+## Supported platforms
+
+| Platform | Architecture | Package |
+|----------|-------------|---------|
+| Windows  | x64, arm64  | `csdl` |
+| Linux    | x64, arm64  | `csdl` |
+| macOS    | x64, arm64  | `csdl` |
+| Android  | arm64-v8a, armeabi-v7a, x86_64 | `csdl` + `csdl.Native.android` |
+
+---
+
+## License
+
+Licensed under [Apache-2.0](license.md).

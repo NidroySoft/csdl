@@ -355,29 +355,28 @@ internal static partial class NativeMethods
     /// Whether to actively prefetch tail pieces during bootstrap.
     /// <c>true</c> (recommended) helps with quick seeks and metadata retrieval.
     /// </param>
-    [LibraryImport(LibraryName, EntryPoint = "configure_stream_server")]
-    public static partial void ConfigureStreamServer(
-        int cacheLimitMb,
-        int minReadahead, int maxReadahead,
-        int backWindow,
-        int deadlineBaseMs, int deadlineStepMs,
-        int windowUpdateThrottleMs,
-        int piecePollIntervalMs,
-        int piecePollMaxAttempts,
-        int anchorPiecePollMaxAttempts,
-        int ensurePieceMaxRetries,
-        int deadlineReemitIntervalMs,
-        int startupBufferPieces,
-        int tailPieces,
-        [MarshalAs(UnmanagedType.U1)] bool enableTailPrefetch);
+    [DllImport(LibraryName, EntryPoint = "configure_stream_server", CallingConvention = CallingConvention.Cdecl)]
+    public static extern void ConfigureStreamServer(
+     int cacheLimitMb,
+     int minReadahead, int maxReadahead,
+     int backWindow,
+     int deadlineBaseMs, int deadlineStepMs,
+     int windowUpdateThrottleMs,
+     int piecePollIntervalMs,
+     int piecePollMaxAttempts,
+     int anchorPiecePollMaxAttempts,
+     int ensurePieceMaxRetries,
+     int deadlineReemitIntervalMs,
+     int startupBufferPieces,
+     int tailPieces,
+     [MarshalAs(UnmanagedType.U1)] bool enableTailPrefetch);
 
     /// <summary>
     /// Creates a native settings pack pre‑configured for streaming.
     /// The returned handle must be freed with <see cref="FreeSettingsPack"/>.
     /// </summary>
-    /// <returns>A handle to the native settings pack.</returns>
-    [LibraryImport(LibraryName, EntryPoint = "create_streaming_settings")]
-    public static partial IntPtr CreateStreamingSettingsPack();
+    [DllImport(LibraryName, EntryPoint = "create_streaming_settings", CallingConvention = CallingConvention.Cdecl)]
+    public static extern IntPtr CreateStreamingSettingsPack();
 
     #endregion
 }
